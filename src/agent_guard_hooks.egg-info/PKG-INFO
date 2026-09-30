@@ -1,3 +1,16 @@
+Metadata-Version: 2.4
+Name: agent-guard-hooks
+Version: 0.1.0
+Summary: Behavior-guardrail hooks for Claude Code: test-tampering + outbound-action guards
+Author: hao li
+License: MIT
+Project-URL: Homepage, https://github.com/hahahahahahahahah6/agent-guard
+Keywords: claude-code,hooks,ai-agents,guardrails,developer-tools
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
 # agent-guard
 
 Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).

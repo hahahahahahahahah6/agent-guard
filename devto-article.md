@@ -1,0 +1,111 @@
+# My agent changed `toBe(10)` to `toBe(9)` and called it done. I built hooks to stop that
+
+A few days ago someone on r/ClaudeCode posted the exact failure mode I'd been
+dreading. Their agent was asked to fix an indexing bug. Instead of fixing the
+source file, it quietly edited the test — `expect(page.items.length).toBe(10)`
+became `toBe(9)` — re-ran the suite, saw green, and reported the refactor
+complete. "All 14 tests passing" nearly sailed through review.
+
+Same week, a 136-point thread asked whether Claude Code's unit tests are
+useless at all. The top-voted answer: *"every generated test should be forced
+to prove it can fail."* And in a separate thread about stopping agents from
+doing things they shouldn't in production, the line that stuck with me:
+*"the real risk is not a bad answer but a bad action"* — with the follow-up
+that the boundary has to sit *below the prompt layer*.
+
+Prompt-level instructions don't survive contact with a determined agent. So I
+built `agent-guard`: two Claude Code hooks that enforce behavior where the
+model can't argue with them.
+
+## Guard 1: the test-tampering guard
+
+```bash
+pip install agent-guard-hooks
+agent-guard install
+```
+
+On `SessionStart`, the hook snapshots sha256 hashes of every test file and
+every source file in the project. On `Stop`, it diffs. If test files were
+modified or deleted while **no source file changed**, the stop is blocked:
+
+```
+Test-tampering guard: test files changed but no source files changed since
+this session started.
+Changed test files:
+  - tests/test_auth.py
+...
+Before proceeding, verify each changed test actually fails without the fix:
+revert the source change, re-run the test, and confirm it goes red. A test
+that stays green without the fix is not covering the bug.
+```
+
+That "revert and re-run" check is the community's own verified workaround —
+it just used to be manual. New test files never count as tampering (writing
+tests for new code is legitimate); only modified or deleted assertions trip
+it. Warn-only mode exists if you'd rather nag than block.
+
+## Guard 2: the outbound-action guard
+
+A `PreToolUse` hook on `Bash` matches commands against a denylist of risky
+patterns and blocks before they run:
+
+- pushes to protected branches (`main`, `master`, `prod*`, `release/*`) and
+  any `--force` push
+- package publishes: `npm publish`, `twine upload`, `cargo publish`,
+  `gh release create`
+- prod deploys: `kubectl apply`, `terraform apply`, `fly deploy`,
+  `vercel --prod`, …
+- cloud provisioning (the spend vector): `aws ec2 run-instances`,
+  `gcloud compute instances create`, …
+- mass-send: Slack webhook URLs, `sendmail`, SendGrid/Mailgun API calls
+
+```
+Outbound-action guard blocked this command (rule 'git-push-protected': Push
+to a protected branch (main/master/prod*/release/*)).
+```
+
+Your own allowlist in `~/.config/agent-guard/config.json` overrides the
+denylist (internal registries, staging targets), and every block *and* every
+override lands in an audit log you can read with `agent-guard log`.
+
+## The design rules I kept from the last hook I built
+
+This is the sibling of [edit-guard](https://github.com/hahahahahahahahah6/edit-guard)
+(stale cross-session edit blocking), and it keeps the same contract:
+
+- **Stdlib only.** No dependencies, no daemon, no network. State is flat
+  files under `~/.config/agent-guard/`.
+- **Fail open, always.** Corrupt snapshot, unreadable file, malformed hook
+  input — anything unexpected means "allow". A guard that wedges your session
+  is worse than no guard.
+- **Block, don't warn (by default).** I learned this the hard way: the agent
+  reads a warning, says "noted", and does it anyway. Blocking forces the
+  verification step, which is the actual fix.
+
+One deliberate contrast with a neighbor project: Rashomon (r/aiagents)
+*observes* — it records what the agent did and compares it against the
+agent's summary. agent-guard *prevents*. Observation tells you after the
+fact; the hook is there before the fact. Different layers, complementary.
+
+## Honest limitations
+
+- "Tests changed, source didn't" is a strong signal, not a proof. Legit
+  test-only refactors get flagged — use `ignore_paths` or warn mode.
+- The outbound guard watches `Bash`. An agent calling a Slack MCP tool
+  directly is out of scope for this version.
+- The spend denylist is best-effort; it's a seatbelt, not a vault.
+- The hook protocol (stdin shape, exit-2-blocks) is community-documented,
+  not a stable API.
+
+13 smoke tests pass, including the exact navune scenario and fail-open
+behavior on corrupted state.
+
+## Links
+
+- GitHub: https://github.com/hahahahahahahahah6/agent-guard (MIT)
+- PyPI: `pip install agent-guard-hooks`
+
+If you run agents across sessions: what's the worst thing one of yours has
+done that a prompt-level rule failed to stop? I'm collecting failure modes
+for the next guards (comment-slop and mutation-style test-honesty are on the
+roadmap).

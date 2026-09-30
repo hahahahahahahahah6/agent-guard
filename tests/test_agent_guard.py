@@ -1,0 +1,214 @@
+"""Smoke tests for agent-guard. Run: python3 tests/test_agent_guard.py"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                   "src")
+ENV_BASE = dict(os.environ, PYTHONPATH=SRC + os.pathsep +
+                os.environ.get("PYTHONPATH", ""))
+
+
+def run_hook(args, stdin_obj, cwd, env_extra=None):
+    env = dict(ENV_BASE)
+    env.update(env_extra or {})
+    p = subprocess.run(
+        [sys.executable, "-m", "agent_guard"] + args,
+        input=json.dumps(stdin_obj) if stdin_obj is not None else "",
+        capture_output=True, text=True, cwd=cwd, env=env, timeout=30)
+    return p.returncode, p.stdout, p.stderr
+
+
+def make_proj(tmp):
+    proj = os.path.join(tmp, "proj")
+    os.makedirs(os.path.join(proj, "src"))
+    os.makedirs(os.path.join(proj, "tests"))
+    with open(os.path.join(proj, "src", "app.py"), "w") as fh:
+        fh.write("def add(a, b):\n    return a + b\n")
+    with open(os.path.join(proj, "tests", "test_app.py"), "w") as fh:
+        fh.write("def test_add():\n    assert add(1, 2) == 3\n")
+    return proj
+
+
+def snapshot(proj, state_dir):
+    code, _, err = run_hook(["hook-snapshot"], {"session_id": "s1"},
+                            proj, {"AGENT_GUARD_DIR": state_dir})
+    assert code == 0, err
+
+
+def stop_check(proj, state_dir, env_extra=None):
+    env = {"AGENT_GUARD_DIR": state_dir}
+    env.update(env_extra or {})
+    return run_hook(["hook-test"], {"session_id": "s1"}, proj, env)
+
+
+def bash_check(cmd, state_dir, config=None, env_extra=None):
+    if config is not None:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "config.json"), "w") as fh:
+            json.dump(config, fh)
+    env = {"AGENT_GUARD_DIR": state_dir}
+    env.update(env_extra or {})
+    return run_hook(["hook-outbound"],
+                    {"session_id": "s1", "tool_name": "Bash",
+                     "tool_input": {"command": cmd}},
+                    "/tmp", env)
+
+
+PASS = []
+
+
+def check(name, cond, detail=""):
+    PASS.append(cond)
+    print(("PASS " if cond else "FAIL ") + name + (" — " + detail if detail and not cond else ""))
+
+
+def main():
+    # --- test-tampering guard ---
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)
+        with open(os.path.join(proj, "tests", "test_app.py"), "a") as fh:
+            fh.write("    assert add(0, 0) == 1  # weakened\n")
+        code, _, err = stop_check(proj, sd)
+        check("tests-only change blocked",
+              code == 2 and "fails without the fix" in err, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)
+        with open(os.path.join(proj, "src", "app.py"), "a") as fh:
+            fh.write("def sub(a, b):\n    return a - b\n")
+        with open(os.path.join(proj, "tests", "test_app.py"), "a") as fh:
+            fh.write("def test_sub():\n    assert sub(1, 2) == -1\n")
+        code, _, _ = stop_check(proj, sd)
+        check("source+tests changed -> allowed", code == 0, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)
+        code, _, _ = stop_check(proj, sd)
+        check("no change -> allowed", code == 0, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)
+        with open(os.path.join(sd, "test-snapshot.json"), "w") as fh:
+            fh.write("{corrupt!!")
+        with open(os.path.join(proj, "tests", "test_app.py"), "a") as fh:
+            fh.write("# x\n")
+        code, _, _ = stop_check(proj, sd)
+        check("corrupt snapshot -> fail open", code == 0, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)
+        with open(os.path.join(proj, "tests", "test_app.py"), "a") as fh:
+            fh.write("# y\n")
+        code, _, err = stop_check(proj, sd, {"AGENT_GUARD_TEST_MODE": "warn"})
+        check("warn mode never blocks", code == 0 and "WARNING" in err,
+              "rc=%d" % code)
+
+    # --- outbound-action guard ---
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        code, _, err = bash_check("git push origin main", sd)
+        check("git push origin main blocked",
+              code == 2 and "git-push-protected" in err, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        code, _, err = bash_check("npm publish --access public", sd)
+        check("npm publish blocked", code == 2, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        code, _, err = bash_check("twine upload dist/*", sd)
+        check("twine upload blocked", code == 2 and "package-publish" in err,
+              "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        code1, _, _ = bash_check("git push origin feature/cool-thing", sd)
+        code2, _, _ = bash_check("ls -la && pytest -q", sd)
+        code3, _, _ = bash_check("npm publish --dry-run", sd)
+        check("benign commands allowed",
+              code1 == 0 and code2 == 0 and code3 == 0,
+              "rc=%d,%d,%d" % (code1, code2, code3))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        cfg = {"outbound": {"allow": [r"my-registry\.internal"]}}
+        code, _, _ = bash_check(
+            "npm publish --registry https://my-registry.internal", sd, cfg)
+        entries = []
+        ap = os.path.join(sd, "audit.jsonl")
+        if os.path.exists(ap):
+            for line in open(ap):
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    pass
+        check("allowlist override allowed+audited",
+              code == 0 and any(e.get("decision") == "allowed-override"
+                                for e in entries),
+              "rc=%d entries=%d" % (code, len(entries)))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        p = subprocess.run(
+            [sys.executable, "-m", "agent_guard", "hook-outbound"],
+            input="not json{{{{", capture_output=True, text=True,
+            cwd="/tmp", env=dict(ENV_BASE, AGENT_GUARD_DIR=sd), timeout=30)
+        check("garbage stdin -> fail open", p.returncode == 0,
+              "rc=%d" % p.returncode)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        code, _, _ = bash_check(
+            "curl -X POST https://hooks.slack.com/services/T/B/X -d hi", sd)
+        ap = os.path.join(sd, "audit.jsonl")
+        entries = [json.loads(l) for l in open(ap)] if os.path.exists(ap) else []
+        check("block writes audit entry",
+              code == 2 and any(e.get("decision") == "blocked"
+                                and e.get("rule") == "mass-send"
+                                for e in entries),
+              "rc=%d entries=%d" % (code, len(entries)))
+
+    # --- install ---
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        os.makedirs(os.path.join(home, ".claude"))
+        sp = os.path.join(home, ".claude", "settings.json")
+        with open(sp, "w") as fh:
+            json.dump({"hooks": {"PreToolUse": []}}, fh)
+        env = dict(ENV_BASE, HOME=home)
+        for _ in range(2):
+            p = subprocess.run([sys.executable, "-m", "agent_guard", "install"],
+                               capture_output=True, text=True, env=env,
+                               timeout=30)
+            assert p.returncode == 0, p.stderr
+        settings = json.load(open(sp))
+        n_start = len(settings["hooks"].get("SessionStart", []))
+        n_stop = len(settings["hooks"].get("Stop", []))
+        n_pre = len(settings["hooks"].get("PreToolUse", []))
+        bak_ok = os.path.exists(sp + ".bak")
+        check("install idempotent",
+              n_start == 1 and n_stop == 1 and n_pre == 1 and bak_ok,
+              "start=%d stop=%d pre=%d bak=%s"
+              % (n_start, n_stop, n_pre, bak_ok))
+
+    print("\n%d/%d passed" % (sum(PASS), len(PASS)))
+    return 0 if all(PASS) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

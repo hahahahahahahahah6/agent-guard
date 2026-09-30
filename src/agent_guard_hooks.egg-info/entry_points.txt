@@ -1,0 +1,2 @@
+[console_scripts]
+agent-guard = agent_guard.cli:main
