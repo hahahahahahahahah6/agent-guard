@@ -1,12 +1,13 @@
 """agent-guard: behavior-guardrail hooks for Claude Code."""
 
 import argparse
+import copy
 import json
 import os
 import shutil
 import sys
 
-from . import mutate, outbound, state, testguard, verify
+from . import commentslop, mutate, outbound, state, testguard, verify
 
 
 def _hook_input():
@@ -127,6 +128,145 @@ def cmd_mutate(args):
         return 0
 
 
+def _decomment_check(files, threshold):
+    """Print per-file slop scores; exit 1 if any file hits the threshold."""
+    try:
+        bad = 0
+        for path in files:
+            score, hits = commentslop.score_file(path)
+            flag = "SLOP" if score >= threshold else "ok"
+            print("%s: score %.1f (%d hits) [%s]" % (path, score, len(hits),
+                                                    flag))
+            for ln, end_ln, kind, excerpt in hits[:10]:
+                loc = "L%d" % ln if ln == end_ln else "L%d-%d" % (ln, end_ln)
+                print("  %s [%s] %s" % (loc, kind, excerpt))
+            if score >= threshold:
+                bad += 1
+        if bad:
+            print("%d file(s) at or above the slop threshold (%.1f)."
+                  % (bad, threshold))
+            return 1
+        return 0
+    except Exception as e:
+        sys.stderr.write("decomment --check: internal error (%s); "
+                         "failing open.\n" % e)
+        return 0
+
+
+def _decomment_fix(files):
+    """Remove commented-code blocks only, with .bak backups."""
+    try:
+        for path in files:
+            removed, bak = commentslop.fix_file(path)
+            if removed:
+                print("%s: removed %d commented-out line(s), backup at %s"
+                      % (path, removed, bak))
+            else:
+                print("%s: nothing to fix" % path)
+        return 0
+    except Exception as e:
+        sys.stderr.write("decomment --fix: internal error (%s); aborting.\n"
+                         % e)
+        return 1
+
+
+def cmd_decomment(args):
+    """Check or fix comment slop in files."""
+    try:
+        files = args.files or []
+        if args.fix:
+            return _decomment_fix(files)
+        cfg = state.load_config()
+        threshold = args.threshold
+        if threshold is None:
+            threshold = commentslop.threshold(cfg)
+        return _decomment_check(files, threshold)
+    except Exception as e:
+        sys.stderr.write("decomment: internal error (%s); failing open.\n"
+                         % e)
+        return 0
+
+
+def _added_text(tool, tool_input):
+    """Comment-bearing text the agent is adding. Never raises."""
+    try:
+        if tool == "Write":
+            content = tool_input.get("content")
+            return content if isinstance(content, str) else ""
+        # Edit: new_string, or a list of edits
+        new_string = tool_input.get("new_string")
+        if isinstance(new_string, str):
+            return new_string
+        parts = []
+        edits = tool_input.get("edits")
+        if isinstance(edits, list):
+            for e in edits:
+                if isinstance(e, dict):
+                    s = e.get("new_string")
+                    if isinstance(s, str):
+                        parts.append(s)
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def cmd_commentslop(args):
+    """PreToolUse on Write/Edit: block comment slop in added text.
+
+    Only the ADDED/NEW comment lines are scored, never the whole file —
+    pre-existing code is not punished. Blocks (exit 2) in block mode,
+    warns (exit 0) in warn mode. Fails open on everything unexpected.
+    """
+    try:
+        data = _hook_input()
+        tool = data.get("tool_name", "")
+        if tool not in ("Write", "Edit"):
+            return 0
+        tool_input = data.get("tool_input")
+        if not isinstance(tool_input, dict):
+            return 0
+        session = str(data.get("session_id", "") or "unknown")
+        path = tool_input.get("file_path") or ""
+        added = _added_text(tool, tool_input)
+        if not added.strip():
+            return 0
+        cfg = state.load_config()
+        score, hits = commentslop.score_text(
+            added, commentslop.lang_of(path))
+        threshold = commentslop.threshold(cfg)
+        if score < threshold:
+            return 0
+        lines = []
+        for ln, end_ln, kind, excerpt in hits[:8]:
+            loc = "L%d" % ln if ln == end_ln else "L%d-%d" % (ln, end_ln)
+            lines.append("  %s [%s] %s" % (loc, kind, excerpt))
+        reason = (
+            "Comment-slop guard: the %s is adding comments that look like "
+            "narrative slop (score %.1f >= %.1f).\n%s\n"
+            "Trim the narrative — keep only what the code doesn't already "
+            "say. `agent-guard decomment --fix <file>` removes "
+            "commented-out code automatically.\n"
+            "Bypass (not recommended): AGENT_GUARD_COMMENT_MODE=warn, or "
+            "comment_slop.mode=warn in %s."
+            % (tool, score, threshold, "\n".join(lines),
+               state.config_path()))
+        state.append_audit({
+            "guard": "commentslop", "tool": tool, "session": session,
+            "file": str(path)[:200],
+            "decision": "blocked" if commentslop.mode(cfg) == "block"
+                        else "warn",
+            "score": score,
+            "reason": reason.split("\n")[0],
+        })
+        if commentslop.mode(cfg) == "warn":
+            sys.stderr.write("WARNING (not blocking): " + reason + "\n")
+            return 0
+        sys.stderr.write(reason + "\n")
+        return 2
+    except Exception:
+        return 0  # fail open, always
+
+
 def _settings_path():
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 
@@ -138,25 +278,32 @@ SNIPPETS = {
                          "command": "agent-guard hook-test"}]}],
     "PreToolUse": [{"matcher": "Bash",
                     "hooks": [{"type": "command",
-                               "command": "agent-guard hook-outbound"}]}],
+                               "command": "agent-guard hook-outbound"}]},
+                   {"matcher": "Write|Edit",
+                    "hooks": [{"type": "command",
+                               "command": "agent-guard hook-commentslop"}]}],
     "PostToolUse": [{"matcher": "Bash",
                      "hooks": [{"type": "command",
                                 "command": "agent-guard hook-verify"}]}],
 }
 
 
-def _present(entries, key):
-    want = SNIPPETS[key]
-    for e in entries:
-        if not isinstance(e, dict):
-            continue
-        if key in ("PreToolUse", "PostToolUse") \
-                and e.get("matcher") != "Bash":
-            continue
-        for h in e.get("hooks", []):
-            if "agent-guard" in (h.get("command", "") or ""):
-                return True
-    return False
+def _entry_present(entries, key, want):
+    """Is one SNIPPETS entry already installed? Never raises."""
+    try:
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            if key in ("PreToolUse", "PostToolUse") \
+                    and e.get("matcher") != want.get("matcher"):
+                continue
+            for h in e.get("hooks", []):
+                if (h.get("command", "") or "") == \
+                        want["hooks"][0]["command"]:
+                    return True
+        return False
+    except Exception:
+        return False
 
 
 def cmd_install(args):
@@ -186,15 +333,16 @@ def cmd_install(args):
         settings["hooks"] = hooks
 
     added = 0
-    for key, snippet in SNIPPETS.items():
+    for key, snippet_list in SNIPPETS.items():
         entries = hooks.get(key)
         if not isinstance(entries, list):
             entries = []
             hooks[key] = entries
-        if _present(entries, key):
-            continue
-        entries.extend(snippet)
-        added += 1
+        for want in snippet_list:
+            if _entry_present(entries, key, want):
+                continue
+            entries.append(copy.deepcopy(want))
+            added += 1
 
     os.makedirs(os.path.dirname(sp), exist_ok=True)
     with open(sp, "w", encoding="utf-8") as fh:
@@ -226,6 +374,8 @@ def cmd_status(args):
     print("audit log:  %s (%d entries)"
           % (state.audit_path(), len(state.read_audit())))
     print("test mode:  %s" % testguard.mode())
+    print("comment mode: %s (threshold %.1f)"
+          % (commentslop.mode(), commentslop.threshold()))
     print("rules:      %s" % ", ".join(outbound.rule_ids()))
     print("settings:   %s" % _settings_path())
     return 0
@@ -235,8 +385,8 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="agent-guard",
         description="Behavior-guardrail hooks for Claude Code: "
-                    "test-tampering + outbound-action guards, mutation "
-                    "test-honesty, and post-exec verification.")
+                    "test-tampering + outbound-action + comment-slop guards, "
+                    "mutation test-honesty, and post-exec verification.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     for name, help_text, func in [
@@ -245,8 +395,11 @@ def build_parser():
         ("hook-outbound", "PreToolUse hook: block risky Bash actions.", cmd_outbound),
         ("hook-verify", "PostToolUse hook: warn when a claimed effect "
                         "isn't visible (never blocks).", cmd_verify),
+        ("hook-commentslop", "PreToolUse hook: block comment slop in "
+                             "Write/Edit.", cmd_commentslop),
         ("mutate-check", "Mutation test-honesty check: mutate assertions, "
                          "re-run tests, report survivors.", cmd_mutate),
+        ("decomment", "Check or fix comment slop in files.", cmd_decomment),
         ("install", "Install hooks into ~/.claude/settings.json.", cmd_install),
         ("log", "Show recent guard decisions.", cmd_log),
         ("status", "Show state paths and config.", cmd_status),
@@ -254,6 +407,15 @@ def build_parser():
         sp = sub.add_parser(name, help=help_text)
         sp.set_defaults(func=func)
     sub.choices["log"].add_argument("--limit", type=int, default=20)
+    dc = sub.choices["decomment"]
+    dc.add_argument("files", nargs="+", help="files to check or fix")
+    dc.add_argument("--check", action="store_true",
+                    help="report slop scores (default mode)")
+    dc.add_argument("--fix", action="store_true",
+                    help="remove commented-out code blocks (with .bak backup)")
+    dc.add_argument("--threshold", type=float, default=None,
+                    help="slop score (0-100) that fails --check (default: "
+                         "config comment_slop.threshold, 30)")
     mc = sub.choices["mutate-check"]
     mc.add_argument("test_file", help="test file to mutate")
     mc.add_argument("test_cmd", nargs="*",
