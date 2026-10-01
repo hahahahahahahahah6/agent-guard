@@ -58,15 +58,19 @@ blocking); agent-guard is the behavior suite.
   not logged (noise); `--verbose`/`AGENT_GUARD_VERBOSE=1` logs everything.
 
 ### Out of MVP → README roadmap
-- (c) comment-slop guard, (d) mutation-style test-honesty hook.
+- (c) comment-slop guard — shipped in v0.3 (`hook-commentslop` +
+  `decomment --check/--fix`); (d) mutation-style test-honesty hook — shipped
+  in v0.2 (`mutate-check`). Roadmap is now empty.
 
 ## Architecture (edit-guard patterns reused)
 - stdlib-only Python. **Fail-open everywhere**: any exception → allow (exit 0).
 - State: `~/.config/agent-guard/` (`AGENT_GUARD_DIR` override).
 - CLI: `agent-guard install|hook-snapshot|hook-test|hook-outbound|log|status`.
-- `install` merges 3 hook entries into `~/.claude/settings.json` with backup,
+- `install` merges 5 hook entries into `~/.claude/settings.json` with backup,
   idempotent: SessionStart → `agent-guard hook-snapshot`; Stop →
-  `agent-guard hook-test`; PreToolUse `Bash` → `agent-guard hook-outbound`.
+  `agent-guard hook-test`; PreToolUse `Bash` → `agent-guard hook-outbound`;
+  PreToolUse `Write|Edit` → `agent-guard hook-commentslop`; PostToolUse
+  `Bash` → `agent-guard hook-verify`.
 
 ## Tests (~12, all must pass)
 test-tamper: tests-only→block+message; src+tests→allow; no-change→allow;
