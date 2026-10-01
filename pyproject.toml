@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-guard-hooks"
-version = "0.2.0"
+version = "0.3.0"
 description = "Behavior-guardrail hooks for Claude Code: test-tampering + outbound-action guards, mutation test-honesty, and post-exec verification"
 readme = "README.md"
 requires-python = ">=3.9"
