@@ -39,10 +39,14 @@ def snapshot(proj, state_dir):
     assert code == 0, err
 
 
-def stop_check(proj, state_dir, env_extra=None):
+def stop_check(proj, state_dir, env_extra=None, session_id="s1",
+               stop_hook_active=False):
     env = {"AGENT_GUARD_DIR": state_dir}
     env.update(env_extra or {})
-    return run_hook(["hook-test"], {"session_id": "s1"}, proj, env)
+    stdin = {"session_id": session_id}
+    if stop_hook_active:
+        stdin["stop_hook_active"] = True
+    return run_hook(["hook-test"], stdin, proj, env)
 
 
 def bash_check(cmd, state_dir, config=None, env_extra=None):
@@ -100,12 +104,47 @@ def main():
         sd = os.path.join(tmp, "state")
         proj = make_proj(tmp)
         snapshot(proj, sd)
-        with open(os.path.join(sd, "test-snapshot.json"), "w") as fh:
+        with open(os.path.join(sd, "test-snapshot.s1.json"), "w") as fh:
             fh.write("{corrupt!!")
         with open(os.path.join(proj, "tests", "test_app.py"), "a") as fh:
             fh.write("# x\n")
         code, _, _ = stop_check(proj, sd)
         check("corrupt snapshot -> fail open", code == 0, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)
+        with open(os.path.join(proj, "tests", "test_app.py"), "a") as fh:
+            fh.write("    assert add(0, 0) == 1  # weakened\n")
+        # First Stop blocks; when Claude Code reports the hook already fired
+        # (stop_hook_active), we MUST NOT block again, or the session loops.
+        code, _, err = stop_check(proj, sd, stop_hook_active=True)
+        check("stop_hook_active -> never blocks (no infinite loop)",
+              code == 0, "rc=%d err=%s" % (code, err.strip()[:80]))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)  # session s1
+        code, _, _ = run_hook(["hook-snapshot"], {"session_id": "s2"},
+                              proj, {"AGENT_GUARD_DIR": sd})
+        assert code == 0
+        s1f = os.path.join(sd, "test-snapshot.s1.json")
+        s2f = os.path.join(sd, "test-snapshot.s2.json")
+        check("snapshots stored per session",
+              os.path.exists(s1f) and os.path.exists(s2f)
+              and not os.path.exists(os.path.join(sd, "test-snapshot.json")))
+        with open(os.path.join(proj, "tests", "test_app.py"), "a") as fh:
+            fh.write("    assert add(0, 0) == 1  # weakened\n")
+        # A session with no snapshot of its own fails open instead of
+        # reading another session's snapshot.
+        code, _, _ = stop_check(proj, sd, session_id="sN")
+        check("unknown session -> fail open (no cross-session block)",
+              code == 0, "rc=%d" % code)
+        code, _, _ = stop_check(proj, sd, session_id="s1")
+        check("own session still blocks on its snapshot",
+              code == 2, "rc=%d" % code)
 
     with tempfile.TemporaryDirectory() as tmp:
         sd = os.path.join(tmp, "state")
@@ -123,6 +162,26 @@ def main():
         code, _, err = bash_check("git push origin main", sd)
         check("git push origin main blocked",
               code == 2 and "git-push-protected" in err, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        push_cases = [
+            ("git push", 2),                       # bare push: target unknown
+            ("git push origin HEAD", 2),           # HEAD resolves to current
+            ("git -C . push origin main", 2),      # flags between git and push
+            ("git push origin main", 2),
+            ("git push origin :main", 2),          # deletes remote main
+            ("git push --force origin main", 2),
+            ("git push origin feature/cool", 0),   # explicit safe branch
+            ("git push origin v1.2.3", 0),         # tag push
+        ]
+        all_ok = True
+        for cmd, want in push_cases:
+            code, _, _ = bash_check(cmd, sd)
+            if code != want:
+                all_ok = False
+                print("   push case rc=%d want=%d: %s" % (code, want, cmd))
+        check("git push parser cases", all_ok)
 
     with tempfile.TemporaryDirectory() as tmp:
         sd = os.path.join(tmp, "state")

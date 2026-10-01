@@ -28,8 +28,30 @@ def audit_path():
     return os.path.join(state_dir(), "audit.jsonl")
 
 
-def snapshot_path():
+def snapshot_path(session_id=None):
+    if session_id:
+        safe = "".join(
+            c for c in str(session_id) if c.isalnum() or c in ("-", "_"))[:64]
+        if safe:
+            return os.path.join(state_dir(), "test-snapshot.%s.json" % safe)
     return os.path.join(state_dir(), "test-snapshot.json")
+
+
+def prune_old_snapshots(max_age_days=7):
+    """Delete per-session snapshots older than max_age_days. Never raises."""
+    try:
+        cutoff = time.time() - max_age_days * 86400
+        d = state_dir()
+        for fn in os.listdir(d):
+            if fn.startswith("test-snapshot.") and fn.endswith(".json"):
+                p = os.path.join(d, fn)
+                try:
+                    if os.path.getmtime(p) < cutoff:
+                        os.remove(p)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def default_config():

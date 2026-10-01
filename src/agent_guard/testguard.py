@@ -74,8 +74,12 @@ def _walk(root, ignore_paths):
     return out
 
 
-def snapshot(root):
-    """Record digests of test + source files. Never raises."""
+def snapshot(root, session_id=None):
+    """Record digests of test + source files. Never raises.
+
+    Snapshots are stored per session_id so two concurrent sessions or
+    projects never overwrite each other.
+    """
     try:
         cfg = state.load_config()
         ignore = cfg["test_guard"].get("ignore_paths", []) or []
@@ -86,29 +90,30 @@ def snapshot(root):
                 continue
             (tests if is_test_file(rel) else sources)[rel] = d
         os.makedirs(state.state_dir(), exist_ok=True)
-        with open(state.snapshot_path(), "w", encoding="utf-8") as fh:
+        with open(state.snapshot_path(session_id), "w", encoding="utf-8") as fh:
             json.dump({"root": os.path.abspath(root), "ts": time.time(),
                        "tests": tests, "sources": sources}, fh)
+        state.prune_old_snapshots()
     except Exception:
         pass
 
 
-def check(root):
+def check(root, session_id=None):
     """Decide whether the session may stop.
 
     Returns (allowed: bool, reason: str). Never raises.
     """
     try:
-        return _check_inner(root)
+        return _check_inner(root, session_id)
     except Exception:
         return True, ""  # fail open
 
 
-def _check_inner(root):
+def _check_inner(root, session_id):
     cfg = state.load_config()
     ignore = cfg["test_guard"].get("ignore_paths", []) or []
     try:
-        with open(state.snapshot_path(), "r", encoding="utf-8") as fh:
+        with open(state.snapshot_path(session_id), "r", encoding="utf-8") as fh:
             snap = json.load(fh)
     except Exception:
         return True, ""  # no usable snapshot: fail open

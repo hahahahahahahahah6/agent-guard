@@ -9,16 +9,12 @@ Everything fails open: any unexpected error means "allow".
 """
 
 import re
+import shlex
 
 # (rule_id, human description, [regexes])
+# NOTE: git push is NOT regexed here; it is parsed by _check_git_push below,
+# which understands `git -C <dir> push`, bare pushes, and HEAD refspecs.
 RULES = [
-    ("git-push-protected",
-     "Push to a protected branch (main/master/prod*/release/*)",
-     [r"\bgit\s+push\b[^|;&]*\b(main|master|prod(uction)?|release/[\w.\-]+)\b"]),
-    ("git-push-force",
-     "Force push (rewrites remote history)",
-     [r"\bgit\s+push\b[^|;&]*--force\b",
-      r"\bgit\s+push\b[^|;&]*\s-f(\s|$)"]),
     ("package-publish",
      "Publish a package (npm/twine/cargo/gh release)",
      [r"\bnpm\s+publish\b(?![^|;&]*--dry-run)",
@@ -55,6 +51,121 @@ _COMPILED = [(rid, desc, [re.compile(p, re.IGNORECASE) for p in pats])
              for rid, desc, pats in RULES]
 
 
+# ---------------------------------------------------------------------------
+# git push: parsed, not regexed
+# ---------------------------------------------------------------------------
+
+def _looks_protected_ref(name):
+    n = name.lower()
+    if n in ("main", "master", "prod", "production"):
+        return True
+    return n.startswith("release/")
+
+
+_GIT_GLOBAL_OPTS_WITH_VAL = {
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--super-prefix", "--config-env",
+}
+_PUSH_OPTS_WITH_VAL = {"--repo", "--receive-pack", "--exec"}
+
+
+def _check_git_push(command):
+    """Block risky `git push` invocations.
+
+    Blocked when a push:
+      * names a protected ref (main/master/prod*/release/*) or HEAD as a
+        refspec source or destination (`git push origin main`,
+        `git push origin HEAD`, `git push origin :main` which *deletes*
+        the remote branch), or
+      * carries no usable refspec, so the target branch cannot be
+        determined (`git push`, `git push origin`).
+    Tolerates git global flags between `git` and `push` (`git -C <dir> push`).
+    Returns (rule_id, detail) or (None, None) when no push is risky.
+    Never raises.
+    """
+    try:
+        return _check_git_push_inner(command)
+    except Exception:
+        return None, None  # fail open
+
+
+def _check_git_push_inner(command):
+    for chunk in re.split(r"[|;&]", command):
+        try:
+            toks = shlex.split(chunk, posix=True)
+        except ValueError:
+            toks = chunk.split()
+
+        gi = next((i for i, t in enumerate(toks)
+                   if t == "git" or t.endswith("/git")), None)
+        if gi is None:
+            continue
+
+        # Skip git global options between `git` and the subcommand.
+        j = gi + 1
+        while j < len(toks):
+            t = toks[j]
+            base = t.split("=", 1)[0]
+            if t in _GIT_GLOBAL_OPTS_WITH_VAL:
+                j += 2
+            elif base in _GIT_GLOBAL_OPTS_WITH_VAL:
+                j += 1  # attached --opt=value form
+            elif t.startswith("-") and t != "-":
+                j += 1  # boolean global flag
+            else:
+                break
+        if j >= len(toks) or toks[j] != "push":
+            continue
+
+        # Parse push args: skip options, collect positional args.
+        args, force = [], False
+        k = j + 1
+        while k < len(toks):
+            t = toks[k]
+            if t == "--":
+                args.extend(toks[k + 1:])
+                break
+            if t.startswith("-") and t != "-":
+                base = t.split("=", 1)[0]
+                if base in ("--force", "-f"):
+                    force = True
+                if base in _PUSH_OPTS_WITH_VAL and "=" not in t:
+                    k += 2
+                else:
+                    k += 1
+                continue
+            args.append(t)
+            k += 1
+
+        if force:
+            return ("git-push-force",
+                    "force push rewrites remote history")
+        if not args:
+            return ("git-push-protected",
+                    "bare `git push` (target branch cannot be determined)")
+        if len(args) == 1:
+            # `git push <x>`: ambiguous between remote and refspec; if <x>
+            # is a remote, the current branch gets pushed. Block it.
+            return ("git-push-protected",
+                    "`git push %s` (target branch cannot be determined)"
+                    % args[0])
+        # args[0] is the remote; the rest are refspecs.
+        for rs in args[1:]:
+            core = rs.lstrip("+^")
+            parts = [p for p in core.split(":") if p != ""]
+            names = parts or [core]
+            for name in names:
+                short = name.split("/")[-1]
+                if short.upper() == "HEAD" or name.upper() == "HEAD":
+                    return ("git-push-protected",
+                            "`git push` targeting HEAD (resolves to the "
+                            "current branch)")
+                if _looks_protected_ref(short) or _looks_protected_ref(name):
+                    return ("git-push-protected",
+                            "push to protected ref '%s'" % name)
+    return None, None
+
+
 def check(command, config=None):
     """Decide whether a Bash command may run.
 
@@ -79,6 +190,21 @@ def _check_inner(command, config):
             continue
 
     disabled = set(out.get("disabled_rules", []) or [])
+
+    rid, detail = _check_git_push(command)
+    if rid is not None and rid not in disabled:
+        desc = {"git-push-protected":
+                "Push to a protected branch (main/master/prod*/release/*), "
+                "a bare push, or a HEAD push",
+                "git-push-force":
+                "Force push (rewrites remote history)"}[rid]
+        reason = (
+            "Outbound-action guard blocked this command (rule '%s': %s: %s).\n"
+            "If this action is intended, add an allowlist regex to "
+            "outbound.allow in %s, or run it yourself outside the agent."
+            % (rid, desc, detail, _config_hint()))
+        return False, reason, rid
+
     for rid, desc, rxs in _COMPILED:
         if rid in disabled:
             continue
@@ -109,4 +235,5 @@ def _config_hint():
 
 
 def rule_ids():
-    return [rid for rid, _, _ in RULES]
+    return (["git-push-protected", "git-push-force"]
+            + [rid for rid, _, _ in RULES])

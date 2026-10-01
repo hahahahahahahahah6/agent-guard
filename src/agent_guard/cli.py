@@ -31,19 +31,28 @@ def cmd_snapshot(args):
     """SessionStart: record test+source digests. Never blocks."""
     try:
         data = _hook_input()
-        testguard.snapshot(_project_root(data))
+        session = str(data.get("session_id", "") or "")
+        testguard.snapshot(_project_root(data), session_id=session or None)
     except Exception:
         pass
     return 0
 
 
 def cmd_test(args):
-    """Stop: diff test files vs snapshot; block tests-only changes."""
+    """Stop: diff test files vs snapshot; block tests-only changes.
+
+    Honors `stop_hook_active`: when Claude Code tells us a Stop hook already
+    fired, we must not block again or the session can never end (infinite
+    loop). The first block already delivered the warning to the agent.
+    """
     try:
         data = _hook_input()
+        if data.get("stop_hook_active"):
+            return 0
         session = str(data.get("session_id", "") or "unknown")
         root = _project_root(data)
-        allowed, reason = testguard.check(root)
+        sid = None if session == "unknown" else session
+        allowed, reason = testguard.check(root, session_id=sid)
         if not allowed:
             state.append_audit({
                 "guard": "test", "tool": "Stop", "session": session,
