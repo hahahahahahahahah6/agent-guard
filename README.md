@@ -1,7 +1,7 @@
 # agent-guard
 
 Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-Three guards plus a test-honesty CLI, one install, zero dependencies (Python
+Four guards plus a test-honesty CLI, one install, zero dependencies (Python
 standard library only):
 
 - **Test-tampering guard** — stops the "green by editing the test" cheat.
@@ -26,6 +26,13 @@ standard library only):
   deliberately breaks assertions (regex-based mutants for JS/TS and Python),
   re-runs the tests per mutant, and reports survivors: tests that stayed
   green don't actually cover the bug.
+- **Comment-slop guard** (v0.3) — a `PreToolUse` hook on `Write`/`Edit` that
+  scores the *added* comments (never pre-existing code) for narrative slop:
+  commented-out code, restatements of obvious code ("This function adds two
+  numbers"), in-code changelogs, meta/apologetic notes, emoji, and
+  docstrings that just restate the signature. Blocks at a configurable
+  threshold, or `agent-guard decomment --check/--fix` for a one-command
+  decomment pass before PRs.
 
 The failure modes are real, quoted from the community:
 
@@ -54,6 +61,36 @@ The failure modes are real, quoted from the community:
   adds post-exec read-back as defense-in-depth *on top of* PreToolUse
   prevention: block the bad action before it happens, then verify the claimed
   effect is actually visible afterwards. Prevent first, verify after.
+
+## v0.3: comment-slop guard
+
+```bash
+agent-guard decomment --check src/           # per-file slop scores, exit 1 over threshold
+agent-guard decomment --fix src/app.py       # remove commented-out code only (writes .bak)
+```
+
+`install` registers `agent-guard hook-commentslop` as a `PreToolUse` hook
+on `Write`/`Edit`. It scores only the *added* comment lines — your existing
+codebase is never punished — and blocks (exit 2) when the added-slop score
+reaches the threshold (default 30/100). The block message names the lines
+and the slop kind, and points at `decomment --fix`. Six slop kinds, all
+regex-based and deliberately conservative (when in doubt, it doesn't flag):
+
+- **commented-code** (weighted highest): 2+ consecutive comment lines that
+  look like code — dead code left in comments instead of deleted
+- **restatement**: "This function …", "Here we …", "The following …"
+- **changelog**: "Fixed …", "Updated …" narrating the diff inside the code
+  (belongs in the commit message)
+- **meta-apology**: HACK, "sorry", "workaround", "fix this later", `!!!`
+- **emoji** in comments
+- **obvious-doc**: a docstring whose words are >70% covered by the next
+  line's identifiers (e.g. `"""Add a and b."""` above `def add(a, b)`)
+
+Tool directives (`# noqa`, `# type: ignore`, `eslint-disable`, …) are never
+flagged. `--fix` is surgical: it removes only `commented-code` blocks and
+always writes a `.bak` backup first. Warn mode
+(`AGENT_GUARD_COMMENT_MODE=warn` or `comment_slop.mode=warn` in config)
+advises instead of blocking. Everything fails open.
 
 ## v0.2: script-content inspection, mutation test-honesty, post-exec verification
 
@@ -115,12 +152,14 @@ pip install .
 agent-guard install
 ```
 
-`install` merges four hook entries into `~/.claude/settings.json` (backing it
+`install` merges five hook entries into `~/.claude/settings.json` (backing it
 up first, never clobbering existing settings):
 
 - `SessionStart` → `agent-guard hook-snapshot` (records digests, never blocks)
 - `Stop` → `agent-guard hook-test` (blocks tests-only changes)
 - `PreToolUse` on `Bash` → `agent-guard hook-outbound` (blocks denylisted actions)
+- `PreToolUse` on `Write|Edit` → `agent-guard hook-commentslop` (blocks
+  comment slop in added text)
 - `PostToolUse` on `Bash` → `agent-guard hook-verify` (warns when a claimed
   effect isn't visible; never blocks)
 
@@ -173,12 +212,20 @@ allowed rather than breaking your workflow.
     "allow": ["my-registry\\.internal"],
     "deny_extra": ["rm -rf /tmp/scratch"],
     "disabled_rules": ["cloud-provision"]
+  },
+  "comment_slop": {
+    "mode": "block",
+    "threshold": 30
   }
 }
 ```
 
 - `test_guard.mode`: `"block"` (default) or `"warn"`. Env override:
   `AGENT_GUARD_TEST_MODE=warn`.
+- `comment_slop.mode`: `"block"` (default) or `"warn"`. Env override:
+  `AGENT_GUARD_COMMENT_MODE=warn`.
+- `comment_slop.threshold`: slop score (0–100) at which the comment hook
+  trips. Env override: `AGENT_GUARD_COMMENT_THRESHOLD`.
 - `outbound.allow`: regexes that win over the denylist (e.g. your internal
   registry). Every override is audit-logged.
 - `outbound.deny_extra` / `disabled_rules`: extend or trim the denylist.
@@ -226,12 +273,23 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
 - **The post-exec verifier is advisory.** It warns on stderr and always exits
   0; unreachable remotes, missing npm, and timed-out checks stay silent
   rather than crying wolf.
+- **Slop detection is stylistic, not semantic.** The six patterns are regex
+  heuristics tuned for low false positives, which means they miss subtler
+  slop (a well-written but pointless paragraph scores 0). Short added
+  comments normalize aggressively — one narrative line in an otherwise
+  comment-free edit scores high, by design. If your codebase has a
+  comment-heavy style (or non-English comments the patterns don't cover),
+  use warn mode or raise `comment_slop.threshold`.
+- **`decomment --fix` only removes commented-out code.** Other slop kinds
+  are reported, never auto-edited — deleting prose automatically is how you
+  lose the one comment that mattered.
 
 ## Roadmap
 
-- **Comment-slop guard**: intercept the agent dumping conversation state into
+- ~~**Comment-slop guard**: intercept the agent dumping conversation state into
   code comments (the "9 out of 10 of my revisions is deleting comments"
-  complaint), or a one-command decomment pass before PRs.
+  complaint), or a one-command decomment pass before PRs.~~ — shipped in v0.3
+  as `hook-commentslop` + `decomment --check/--fix`.
 - ~~**Test-honesty hook**: automate the mutation idea — deliberately break an
   assertion, run once, require red~~ — shipped in v0.2 as `mutate-check`.
 
