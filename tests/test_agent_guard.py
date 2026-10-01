@@ -49,17 +49,39 @@ def stop_check(proj, state_dir, env_extra=None, session_id="s1",
     return run_hook(["hook-test"], stdin, proj, env)
 
 
-def bash_check(cmd, state_dir, config=None, env_extra=None):
+def bash_check(cmd, state_dir, config=None, env_extra=None, hook_cwd=None):
     if config is not None:
         os.makedirs(state_dir, exist_ok=True)
         with open(os.path.join(state_dir, "config.json"), "w") as fh:
             json.dump(config, fh)
     env = {"AGENT_GUARD_DIR": state_dir}
     env.update(env_extra or {})
-    return run_hook(["hook-outbound"],
-                    {"session_id": "s1", "tool_name": "Bash",
-                     "tool_input": {"command": cmd}},
-                    "/tmp", env)
+    stdin = {"session_id": "s1", "tool_name": "Bash",
+             "tool_input": {"command": cmd}}
+    if hook_cwd is not None:
+        stdin["cwd"] = hook_cwd  # what the PreToolUse hook reports
+    return run_hook(["hook-outbound"], stdin, "/tmp", env)
+
+
+def make_git_repo(tmp, branch):
+    """A real git repo on `branch`, for destination-aware push tests."""
+    repo = os.path.join(tmp, "repo-" + branch.replace("/", "-"))
+    os.makedirs(repo, exist_ok=True)
+
+    def g(*a):
+        subprocess.run(["git"] + list(a), cwd=repo, capture_output=True,
+                       check=True, timeout=30)
+
+    g("init", "-q")
+    g("config", "user.email", "test@example.com")
+    g("config", "user.name", "test")
+    g("config", "commit.gpgsign", "false")
+    with open(os.path.join(repo, "f.txt"), "w") as fh:
+        fh.write("x\n")
+    g("add", ".")
+    g("commit", "-qm", "init")
+    g("branch", "-M", branch)
+    return repo
 
 
 PASS = []
@@ -165,15 +187,25 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         sd = os.path.join(tmp, "state")
+        # Explicit refspecs need no branch resolution (cwd /tmp is not a repo).
         push_cases = [
-            ("git push", 2),                       # bare push: target unknown
-            ("git push origin HEAD", 2),           # HEAD resolves to current
-            ("git -C . push origin main", 2),      # flags between git and push
             ("git push origin main", 2),
+            ("git -C . push origin main", 2),      # flags between git and push
             ("git push origin :main", 2),          # deletes remote main
+            ("git push origin feature-x:main", 2), # dst main, src feature
+            ("git push origin HEAD:main", 2),      # dst main
             ("git push --force origin main", 2),
+            ("git push --force-with-lease origin main", 2),
+            ("git push --all", 2),                 # pushes every ref
+            ("git push --mirror", 2),
             ("git push origin feature/cool", 0),   # explicit safe branch
+            ("git push origin main:feature-x", 0), # src protected, dst safe
             ("git push origin v1.2.3", 0),         # tag push
+            ("git push --tags", 0),                # tags only, no branch push
+            ("git push --force origin feature-x", 0),  # force, dst unprotected
+            # No refspec and branch unknowable (not a repo) -> fail open.
+            ("git push", 0),
+            ("git push origin", 0),
         ]
         all_ok = True
         for cmd, want in push_cases:
@@ -182,6 +214,51 @@ def main():
                 all_ok = False
                 print("   push case rc=%d want=%d: %s" % (code, want, cmd))
         check("git push parser cases", all_ok)
+
+    # --- destination-aware push blocking (real git repos) ---
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        feat = make_git_repo(tmp, "feature/cool")
+        main = make_git_repo(tmp, "main")
+        detach = make_git_repo(tmp, "feature/detach")
+        subprocess.run(["git", "checkout", "-q", "--detach", "HEAD"],
+                       cwd=detach, capture_output=True, timeout=30)
+        cases = [
+            # (name, command, hook cwd, want rc)
+            ("plain push on feature branch allowed",
+             "git push", feat, 0),
+            ("push origin HEAD on feature allowed",
+             "git push origin HEAD", feat, 0),
+            ("push remote-only on feature allowed",
+             "git push origin", feat, 0),
+            ("plain push on main blocked",
+             "git push", main, 2),
+            ("push origin HEAD on main blocked",
+             "git push origin HEAD", main, 2),
+            ("push origin main from feature branch blocked",
+             "git push origin main", feat, 2),
+            ("push feature-x:main from feature branch blocked",
+             "git push origin feature-x:main", feat, 2),
+            ("-C feature repo: plain push allowed",
+             "git -C %s push" % feat, "/tmp", 0),
+            ("-C main repo: plain push blocked",
+             "git -C %s push" % main, "/tmp", 2),
+            ("force push feature branch allowed",
+             "git push --force origin feature/cool", feat, 0),
+            ("force push main blocked",
+             "git push --force origin main", feat, 2),
+            ("delete non-protected remote branch allowed",
+             "git push origin :feature/gone", feat, 0),
+            ("detached HEAD: branch unknowable -> fail open",
+             "git push", detach, 0),
+        ]
+        all_ok = True
+        for name, cmd, hook_cwd, want in cases:
+            code, _, _ = bash_check(cmd, sd, hook_cwd=hook_cwd)
+            if code != want:
+                all_ok = False
+                print("   rc=%d want=%d: %s [%s]" % (code, want, cmd, name))
+        check("destination-aware push blocking", all_ok)
 
     with tempfile.TemporaryDirectory() as tmp:
         sd = os.path.join(tmp, "state")

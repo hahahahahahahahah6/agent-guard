@@ -80,7 +80,8 @@ def cmd_outbound(args):
         tool_input = data.get("tool_input")
         command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
         cfg = state.load_config()
-        allowed, reason, rule = outbound.check(command, cfg)
+        hook_cwd = data.get("cwd") or os.getcwd()
+        allowed, reason, rule = outbound.check(command, cfg, cwd=hook_cwd)
         verbose = os.environ.get("AGENT_GUARD_VERBOSE", "") == "1"
         if rule is not None or verbose:
             state.append_audit({

@@ -78,15 +78,18 @@ Outbound action blocked before it runs:
 
 ```
 Outbound-action guard blocked this command (rule 'git-push-protected': Push to
-a protected branch (main/master/prod*/release/*), a bare push, or a HEAD push:
-push to protected ref 'main').
+a protected branch (main/master/prod*/release/*): push to protected ref 'main').
 If this action is intended, add an allowlist regex to outbound.allow in
 ~/.config/agent-guard/config.json, or run it yourself outside the agent.
 ```
 
-Note: bare `git push` and `git push <remote>` (no refspec) are blocked too,
-because the target branch can't be determined from the command alone. Push
-explicitly (`git push origin my-branch`) or allowlist your workflow.
+Note: push blocking is destination-aware. A bare `git push` (or
+`git push <remote>`) resolves the destination to the current branch via
+`git symbolic-ref --short HEAD` in the hook's working directory
+(`git -C <dir>` is honored), so pushing a feature branch is allowed and
+only pushes whose destination is a protected branch are blocked. If the
+branch can't be determined (detached HEAD, not a git repo), the push is
+allowed rather than breaking your workflow.
 
 ## Configuration
 
