@@ -9,8 +9,8 @@ Two guards, one install, zero dependencies (Python standard library only):
   file changed, the stop is blocked until the agent proves each changed test
   actually fails without the fix.
 - **Outbound-action guard** — a `PreToolUse` hook on `Bash` with a denylist
-  of risky action patterns: pushes to protected branches, force pushes,
-  package publishes (`npm publish`, `twine upload`, …), prod deploys,
+  of risky action patterns: pushes to protected branches (including force
+  pushes), package publishes (`npm publish`, `twine upload`, …), prod deploys,
   cloud provisioning (spend), and mass-send channels (Slack webhooks,
   mailers). Matches block with a named rule; a user allowlist in
   `config.json` overrides the denylist. Every matched decision is written to
