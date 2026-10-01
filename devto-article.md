@@ -112,6 +112,37 @@ One deliberate contrast with a neighbor project: Rashomon (r/aiagents)
 agent's summary. agent-guard *prevents*. Observation tells you after the
 fact; the hook is there before the fact. Different layers, complementary.
 
+## v0.3: the comment-slop guard
+
+The roadmap's last item is now shipped. The failure mode: the agent dumps
+conversation state into code comments — narrative restatements of obvious
+code ("This function adds two numbers"), changelogs narrating the diff,
+commented-out code, apologetic meta-notes. As sfjailbird put it on HN:
+"9 out of 10 of my revisions to Claude's work is deleting or rewriting
+comments." AGENTS.md rules telling the agent not to over-comment don't fix
+it, so it's a hook now.
+
+`install` registers `agent-guard hook-commentslop` as a `PreToolUse` hook on
+`Write`/`Edit`. It scores only the *added* comment lines — pre-existing code
+is never punished — and blocks when the slop score hits the threshold
+(default 30/100). Six regex-based, deliberately conservative slop kinds
+(when in doubt, it doesn't flag): commented-out code (weighted highest),
+restatements ("This function …"), in-code changelogs ("Fixed …" belongs in
+the commit message), meta-apologies (HACK, "sorry", `!!!`), emoji, and
+docstrings that just restate the signature (`"""Add a and b."""` above `def
+add(a, b)`). Tool directives (`# noqa`, `# type: ignore`) are never flagged.
+
+There's also a one-command decomment pass for before PRs:
+
+```bash
+agent-guard decomment --check src/    # per-file scores, exit 1 over threshold
+agent-guard decomment --fix src/      # removes commented-out code only, writes .bak
+```
+
+`--fix` is surgical on purpose: it only removes `commented-code` blocks and
+always writes a `.bak` backup. Auto-deleting prose is how you lose the one
+comment that mattered.
+
 ## Honest limitations
 
 - "Tests changed, source didn't" is a strong signal, not a proof. Legit
@@ -119,12 +150,16 @@ fact; the hook is there before the fact. Different layers, complementary.
 - The outbound guard watches `Bash`. An agent calling a Slack MCP tool
   directly is out of scope for this version.
 - The spend denylist is best-effort; it's a seatbelt, not a vault.
+- Slop detection is stylistic regex heuristics tuned for low false
+  positives — subtle slop (a well-written but pointless paragraph) scores 0.
+  Comment-heavy codebases should use warn mode or raise the threshold.
 - The hook protocol (stdin shape, exit-2-blocks) is community-documented,
   not a stable API.
 
-33 smoke tests pass, including the exact navune scenario, the script-content
-bypass, mutation survivors vs. kills, post-exec warnings, and fail-open
-behavior on corrupted state.
+47 smoke tests pass, including the exact navune scenario, the script-content
+bypass, mutation survivors vs. kills, post-exec warnings, slop kinds +
+`--fix` surgery + hook block/warn paths, and fail-open behavior on corrupted
+state.
 
 ## Links
 
@@ -133,5 +168,4 @@ behavior on corrupted state.
 
 If you run agents across sessions: what's the worst thing one of yours has
 done that a prompt-level rule failed to stop? I'm collecting failure modes
-for the next guard (comment-slop is still on the roadmap; mutation-style
-test-honesty shipped in v0.2).
+for the next guard.
