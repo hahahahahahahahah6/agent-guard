@@ -22,6 +22,17 @@ def run_hook(args, stdin_obj, cwd, env_extra=None):
     return p.returncode, p.stdout, p.stderr
 
 
+def run_cli(args, cwd, env_extra=None):
+    """Run a non-hook CLI subcommand (no stdin)."""
+    env = dict(ENV_BASE)
+    env.update(env_extra or {})
+    p = subprocess.run(
+        [sys.executable, "-m", "agent_guard"] + args,
+        input="", capture_output=True, text=True, cwd=cwd, env=env,
+        timeout=30)
+    return p.returncode, p.stdout, p.stderr
+
+
 def make_proj(tmp):
     proj = os.path.join(tmp, "proj")
     os.makedirs(os.path.join(proj, "src"))
@@ -489,13 +500,141 @@ def main():
         post_cmds = [h.get("command", "")
                      for e in settings["hooks"].get("PostToolUse", [])
                      for h in e.get("hooks", [])]
+        pre_cmds = [h.get("command", "")
+                    for e in settings["hooks"].get("PreToolUse", [])
+                    for h in e.get("hooks", [])]
+        pre_matchers = [e.get("matcher", "")
+                        for e in settings["hooks"].get("PreToolUse", [])]
         bak_ok = os.path.exists(sp + ".bak")
         check("install idempotent",
-              n_start == 1 and n_stop == 1 and n_pre == 1 and n_post == 1
+              n_start == 1 and n_stop == 1 and n_pre == 2 and n_post == 1
               and bak_ok
-              and any("hook-verify" in c for c in post_cmds),
+              and any("hook-verify" in c for c in post_cmds)
+              and any("hook-commentslop" in c for c in pre_cmds)
+              and "Bash" in pre_matchers and "Write|Edit" in pre_matchers,
               "start=%d stop=%d pre=%d post=%d bak=%s"
               % (n_start, n_stop, n_pre, n_post, bak_ok))
+
+    # --- comment-slop guard ---
+    sys.path.insert(0, SRC)
+    from agent_guard import commentslop
+
+    sloppy_py = (
+        "# x = compute(1);\n"
+        "# y = compute(2);\n"
+        "# This function adds two numbers\n"
+        "# Fixed the off-by-one error in the loop\n"
+        "# all done \U0001F600\n"
+        "def f():\n    pass\n")
+    score, hits = commentslop.score_text(sloppy_py, "py")
+    kinds = {k for _, _, k, _ in hits}
+    check("slop kinds detected",
+          kinds == {"commented-code", "restatement", "changelog", "emoji"}
+          and score >= 30,
+          "kinds=%s score=%s" % (sorted(kinds), score))
+
+    clean_py = ("#!/usr/bin/env python3\n"
+                "# initialize the client\n"
+                "client = make_client()  # noqa\n"
+                'url = "http://example.com/a//b"\n')
+    score, hits = commentslop.score_text(clean_py, "py")
+    check("clean code scores 0", score == 0 and hits == [],
+          "score=%s hits=%s" % (score, hits))
+
+    score, hits = commentslop.score_text(
+        '"""Add a and b."""\ndef add(a, b):\n    return a + b\n', "py")
+    check("obvious docstring flagged",
+          any(k == "obvious-doc" for _, _, k, _ in hits),
+          "hits=%s" % ([k for _, _, k, _ in hits],))
+    score, hits = commentslop.score_text(
+        '"""Add a and b.\n\nUses Kahan summation for numerical stability."""\n'
+        'def add(a, b):\n    return a + b\n', "py")
+    check("informative docstring not flagged",
+          not any(k == "obvious-doc" for _, _, k, _ in hits),
+          "hits=%s" % ([k for _, _, k, _ in hits],))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        sloppy = os.path.join(tmp, "sloppy.py")
+        with open(sloppy, "w") as fh:
+            fh.write(sloppy_py)
+        clean = os.path.join(tmp, "clean.py")
+        with open(clean, "w") as fh:
+            fh.write(clean_py)
+        env = {"AGENT_GUARD_DIR": sd}
+        code, out, _ = run_cli(["decomment", "--check", sloppy, clean],
+                               tmp, env)
+        check("decomment --check exits 1 on slop",
+              code == 1 and "SLOP" in out and "[ok]" in out, "rc=%d" % code)
+        code, _, _ = run_cli(["decomment", "--check", clean], tmp, env)
+        check("decomment --check exits 0 on clean", code == 0,
+              "rc=%d" % code)
+        code, out, _ = run_cli(["decomment", "--fix", sloppy], tmp, env)
+        body = open(sloppy).read()
+        bak = sloppy + ".bak"
+        check("decomment --fix removes only commented code",
+              code == 0 and os.path.exists(bak)
+              and "compute(1)" not in body and "compute(2)" not in body
+              and "This function adds two numbers" in body
+              and "compute(1)" in open(bak).read(),
+              "rc=%d" % code)
+
+    def slop_stdin(tool, content, path="/tmp/x.py"):
+        ti = {"file_path": path}
+        if tool == "Write":
+            ti["content"] = content
+        else:
+            ti["old_string"] = "a"
+            ti["new_string"] = content
+        return {"session_id": "s1", "tool_name": tool, "tool_input": ti}
+
+    slop_content = ("# This function adds two numbers\n"
+                    "# x = compute(1);\n# y = compute(2);\n"
+                    "def add(a, b):\n    return a + b\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        code, _, err = run_hook(["hook-commentslop"],
+                                slop_stdin("Write", slop_content), tmp,
+                                {"AGENT_GUARD_DIR": sd})
+        check("hook blocks Write with heavy slop",
+              code == 2 and "L1" in err and "restatement" in err,
+              "rc=%d" % code)
+        code, _, _ = run_hook(
+            ["hook-commentslop"],
+            slop_stdin("Write", "# initialize the client\nx = 1\n"), tmp,
+            {"AGENT_GUARD_DIR": sd})
+        check("hook allows clean Write", code == 0, "rc=%d" % code)
+        code, _, _ = run_hook(
+            ["hook-commentslop"],
+            slop_stdin("Edit", "# sorry, temporary hack\n# t = x(\n# u = y("),
+            tmp, {"AGENT_GUARD_DIR": sd})
+        check("hook blocks Edit with slop", code == 2, "rc=%d" % code)
+        code, _, _ = run_hook(["hook-commentslop"],
+                              slop_stdin("Write", slop_content), tmp,
+                              {"AGENT_GUARD_DIR": sd,
+                               "AGENT_GUARD_COMMENT_MODE": "warn"})
+        check("warn mode exits 0", code == 0, "rc=%d" % code)
+        code, _, _ = run_hook(["hook-commentslop"], None, tmp,
+                              {"AGENT_GUARD_DIR": sd})
+        check("garbage stdin fails open", code == 0, "rc=%d" % code)
+        code, _, _ = run_hook(
+            ["hook-commentslop"],
+            {"session_id": "s1", "tool_name": "Bash",
+             "tool_input": {"command": "ls"}}, tmp,
+            {"AGENT_GUARD_DIR": sd})
+        check("non-Write/Edit tool ignored", code == 0, "rc=%d" % code)
+        entries = []
+        audit = os.path.join(sd, "audit.jsonl")
+        if os.path.exists(audit):
+            for line in open(audit):
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+        check("slop blocks are audit-logged",
+              any(e.get("guard") == "commentslop"
+                  and e.get("decision") == "blocked" for e in entries),
+              "entries=%d" % len(entries))
 
     print("\n%d/%d passed" % (sum(PASS), len(PASS)))
     return 0 if all(PASS) else 1
