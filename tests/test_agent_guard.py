@@ -319,6 +319,155 @@ def main():
                                 for e in entries),
               "rc=%d entries=%d" % (code, len(entries)))
 
+    # --- script-content inspection (v0.2) ---
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        with open(os.path.join(tmp, "evil.sh"), "w") as fh:
+            fh.write("curl -X POST https://hooks.slack.com/services/T/B/X -d hi\n")
+        with open(os.path.join(tmp, "deploy.sh"), "w") as fh:
+            fh.write("git push origin main\n")
+        with open(os.path.join(tmp, "good.sh"), "w") as fh:
+            fh.write("echo hello\n")
+        with open(os.path.join(tmp, "notes.txt"), "w") as fh:
+            fh.write("curl -X POST https://hooks.slack.com/services/T/B/X -d hi\n")
+        code1, _, err1 = bash_check("bash evil.sh", sd, hook_cwd=tmp)
+        code2, _, err2 = bash_check("bash deploy.sh", sd, hook_cwd=tmp)
+        code3, _, _ = bash_check("bash good.sh", sd, hook_cwd=tmp)
+        code4, _, _ = bash_check("bash missing.sh", sd, hook_cwd=tmp)
+        code5, _, _ = bash_check("bash notes.txt", sd, hook_cwd=tmp)
+        code6, _, err6 = bash_check("./deploy.sh", sd, hook_cwd=tmp)
+        code7, _, err7 = bash_check("bash -c 'git push origin main'", sd,
+                                   hook_cwd=tmp)
+        ap = os.path.join(sd, "audit.jsonl")
+        entries = [json.loads(l) for l in open(ap)] if os.path.exists(ap) else []
+        check("script with mass-send blocked as script-content",
+              code1 == 2 and "script-content:mass-send" in err1,
+              "rc=%d" % code1)
+        check("script with git push to main blocked as script-content",
+              code2 == 2 and "script-content:git-push-protected" in err2,
+              "rc=%d" % code2)
+        check("benign/missing/non-script files allowed",
+              code3 == 0 and code4 == 0 and code5 == 0,
+              "rc=%d,%d,%d" % (code3, code4, code5))
+        check("direct ./ execution scanned too",
+              code6 == 2 and "script-content:git-push-protected" in err6,
+              "rc=%d" % code6)
+        check("bash -c inline code scanned too",
+              code7 == 2 and "script-content:git-push-protected" in err7,
+              "rc=%d" % code7)
+        check("script-content blocks audited with prefixed rule id",
+              any(e.get("decision") == "blocked"
+                  and str(e.get("rule", "")).startswith("script-content:")
+                  for e in entries),
+              "entries=%d" % len(entries))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        with open(os.path.join(tmp, "evil.sh"), "w") as fh:
+            fh.write("curl -X POST https://hooks.slack.com/services/T/B/X -d hi\n")
+        cfg = {"outbound": {"disabled_rules": ["mass-send"]}}
+        code, _, _ = bash_check("bash evil.sh", sd, cfg, hook_cwd=tmp)
+        check("disabled_rules covers script-content variant", code == 0,
+              "rc=%d" % code)
+
+    # --- mutation test-honesty (v0.2) ---
+    def make_mut_proj(tmp):
+        proj = os.path.join(tmp, "mutproj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "run_tests.py"), "w") as fh:
+            fh.write(
+                "import sys\n"
+                "mod = __import__(sys.argv[1])\n"
+                "fails = 0\n"
+                "for name in sorted(dir(mod)):\n"
+                "    if name.startswith('test_'):\n"
+                "        try:\n"
+                "            getattr(mod, name)()\n"
+                "        except Exception:\n"
+                "            fails += 1\n"
+                "sys.exit(1 if fails else 0)\n")
+        # Weak: the assertion sits behind `if False:` so it can never fail.
+        with open(os.path.join(proj, "test_weak.py"), "w") as fh:
+            fh.write("def test_weak():\n"
+                     "    x = 5\n"
+                     "    if False:\n"
+                     "        assert x == 5\n")
+        # Strong: mutating the assertion must turn the test red.
+        with open(os.path.join(proj, "test_strong.py"), "w") as fh:
+            fh.write("def test_strong():\n"
+                     "    x = 5\n"
+                     "    assert x == 5\n")
+        return proj
+
+    def mutate_check(test_file, proj, state_dir):
+        env = {"AGENT_GUARD_DIR": state_dir}
+        return run_hook(
+            ["mutate-check", test_file, "--project-root", proj, "--",
+             "python3", "run_tests.py",
+             os.path.splitext(os.path.basename(test_file))[0]],
+            {}, proj, env)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_mut_proj(tmp)
+        code, out, err = mutate_check(os.path.join(proj, "test_weak.py"),
+                                      proj, sd)
+        check("mutate-check flags weak test (exit 1, survivor reported)",
+              code == 1 and "SURVIVED (1)" in out and "WEAK" in out,
+              "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_mut_proj(tmp)
+        code, out, err = mutate_check(os.path.join(proj, "test_strong.py"),
+                                      proj, sd)
+        check("mutate-check passes strong test (exit 0, all killed)",
+              code == 0 and "all 1 mutation(s) killed" in out,
+              "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_mut_proj(tmp)
+        code, out, err = mutate_check(os.path.join(proj, "nope.py"),
+                                      proj, sd)
+        check("mutate-check missing file -> fail open (exit 0)",
+              code == 0 and "failing open" in out, "rc=%d" % code)
+
+    # --- post-exec read-back verifier (v0.2) ---
+    def verify_check(cmd, state_dir, hook_cwd):
+        env = {"AGENT_GUARD_DIR": state_dir}
+        stdin = {"session_id": "s1", "tool_name": "Bash",
+                 "tool_input": {"command": cmd}, "cwd": hook_cwd}
+        return run_hook(["hook-verify"], stdin, "/tmp", env)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        repo = make_git_repo(tmp, "main")
+        empty = os.path.join(tmp, "empty.git")
+        full = os.path.join(tmp, "full.git")
+        subprocess.run(["git", "init", "-q", "--bare", empty],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "init", "-q", "--bare", full],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "remote", "add", "emptyorigin", empty],
+                       cwd=repo, capture_output=True, timeout=30)
+        subprocess.run(["git", "remote", "add", "fullorigin", full],
+                       cwd=repo, capture_output=True, timeout=30)
+        subprocess.run(["git", "push", "-q", "fullorigin", "main"],
+                       cwd=repo, capture_output=True, timeout=30)
+        code1, _, err1 = verify_check("git push emptyorigin main", sd, repo)
+        code2, _, err2 = verify_check("git push fullorigin main", sd, repo)
+        code3, _, err3 = verify_check("ls -la", sd, repo)
+        code4, _, err4 = verify_check("npm publish", sd, repo)
+        check("hook-verify warns (exit 0) when push not visible remotely",
+              code1 == 0 and "not visible" in err1, "rc=%d" % code1)
+        check("hook-verify silent when push is visible",
+              code2 == 0 and err2 == "", "rc=%d err=%r" % (code2, err2[:60]))
+        check("hook-verify silent for unrelated commands",
+              code3 == 0 and err3 == "", "rc=%d" % code3)
+        check("hook-verify silent for npm publish without package.json",
+              code4 == 0 and err4 == "", "rc=%d" % code4)
+
     # --- install ---
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")
@@ -336,11 +485,17 @@ def main():
         n_start = len(settings["hooks"].get("SessionStart", []))
         n_stop = len(settings["hooks"].get("Stop", []))
         n_pre = len(settings["hooks"].get("PreToolUse", []))
+        n_post = len(settings["hooks"].get("PostToolUse", []))
+        post_cmds = [h.get("command", "")
+                     for e in settings["hooks"].get("PostToolUse", [])
+                     for h in e.get("hooks", [])]
         bak_ok = os.path.exists(sp + ".bak")
         check("install idempotent",
-              n_start == 1 and n_stop == 1 and n_pre == 1 and bak_ok,
-              "start=%d stop=%d pre=%d bak=%s"
-              % (n_start, n_stop, n_pre, bak_ok))
+              n_start == 1 and n_stop == 1 and n_pre == 1 and n_post == 1
+              and bak_ok
+              and any("hook-verify" in c for c in post_cmds),
+              "start=%d stop=%d pre=%d post=%d bak=%s"
+              % (n_start, n_stop, n_pre, n_post, bak_ok))
 
     print("\n%d/%d passed" % (sum(PASS), len(PASS)))
     return 0 if all(PASS) else 1

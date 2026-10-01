@@ -14,8 +14,8 @@ doing things they shouldn't in production, the line that stuck with me:
 that the boundary has to sit *below the prompt layer*.
 
 Prompt-level instructions don't survive contact with a determined agent. So I
-built `agent-guard`: two Claude Code hooks that enforce behavior where the
-model can't argue with them.
+built `agent-guard`: Claude Code hooks that enforce behavior where the
+model can't argue with them. v0.2 adds three more layers (below).
 
 ## Guard 1: the test-tampering guard
 
@@ -68,6 +68,31 @@ Your own allowlist in `~/.config/agent-guard/config.json` overrides the
 denylist (internal registries, staging targets), and every block *and* every
 override lands in an audit log you can read with `agent-guard log`.
 
+The denylist failed as soon as the agent wrote the destructive command into
+a script and executed the script instead (`bash evil.sh`). v0.2 closes that:
+when a command executes a script file, the guard scans the script's *content*
+with the same rule logic, and blocks with a `script-content:<rule>` id so the
+audit log shows where the hit came from.
+
+## v0.2: three more layers
+
+**Post-exec read-back verifier.** Prevention isn't the whole story — sometimes
+you want to know the thing you allowed actually happened. A `PostToolUse`
+hook on `Bash` reads back world state after `git push` (`git ls-remote`, is
+the ref actually there?) and `npm publish` (`npm view`, is the version
+visible?), and warns — never blocks — when the claimed effect isn't visible.
+A neighbor project, Kvitansiya (Show HN, 2026-10-01), verifies at stop; this
+is defense-in-depth on top of PreToolUse prevention: prevent first, verify
+after.
+
+**Mutation test-honesty checker.** The Stop hook's "revert and re-run" advice,
+automated: `agent-guard mutate-check tests/test_app.py -- pytest -q`
+generates up to 20 syntactic mutants (`toBe(3)` → `toBe(4)`,
+`assert x == 5` → `assert x == 6`, `===` → `!==`, …), runs the suite against
+each in a temp copy of the project, and reports survivors. A test that stays
+green after its assertion is broken doesn't cover the bug — exit 1 if any
+survive.
+
 ## The design rules I kept from the last hook I built
 
 This is the sibling of [edit-guard](https://github.com/hahahahahahahahah6/edit-guard)
@@ -97,7 +122,8 @@ fact; the hook is there before the fact. Different layers, complementary.
 - The hook protocol (stdin shape, exit-2-blocks) is community-documented,
   not a stable API.
 
-13 smoke tests pass, including the exact navune scenario and fail-open
+33 smoke tests pass, including the exact navune scenario, the script-content
+bypass, mutation survivors vs. kills, post-exec warnings, and fail-open
 behavior on corrupted state.
 
 ## Links
@@ -107,5 +133,5 @@ behavior on corrupted state.
 
 If you run agents across sessions: what's the worst thing one of yours has
 done that a prompt-level rule failed to stop? I'm collecting failure modes
-for the next guards (comment-slop and mutation-style test-honesty are on the
-roadmap).
+for the next guard (comment-slop is still on the roadmap; mutation-style
+test-honesty shipped in v0.2).

@@ -6,7 +6,7 @@ import os
 import shutil
 import sys
 
-from . import outbound, state, testguard
+from . import mutate, outbound, state, testguard, verify
 
 
 def _hook_input():
@@ -99,6 +99,34 @@ def cmd_outbound(args):
         return 0  # fail open, always
 
 
+def cmd_verify(args):
+    """PostToolUse on Bash: warn when a claimed effect isn't visible.
+
+    Advisory only: always exits 0, never blocks.
+    """
+    try:
+        return verify.run_hook()
+    except Exception:
+        return 0  # fail open, always
+
+
+def cmd_mutate(args):
+    """Mutation test-honesty check (see agent_guard.mutate)."""
+    try:
+        cmd = [a for a in (args.test_cmd or []) if a != "--"]
+        code, report = mutate.check(
+            args.test_file, cmd,
+            project_root=args.project_root,
+            max_mutations=args.max_mutations,
+            timeout=args.timeout)
+        sys.stdout.write(report)
+        return code
+    except Exception as e:
+        sys.stderr.write("mutate-check: internal error (%s); failing open.\n"
+                         % e)
+        return 0
+
+
 def _settings_path():
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 
@@ -111,6 +139,9 @@ SNIPPETS = {
     "PreToolUse": [{"matcher": "Bash",
                     "hooks": [{"type": "command",
                                "command": "agent-guard hook-outbound"}]}],
+    "PostToolUse": [{"matcher": "Bash",
+                     "hooks": [{"type": "command",
+                                "command": "agent-guard hook-verify"}]}],
 }
 
 
@@ -119,7 +150,8 @@ def _present(entries, key):
     for e in entries:
         if not isinstance(e, dict):
             continue
-        if key == "PreToolUse" and e.get("matcher") != "Bash":
+        if key in ("PreToolUse", "PostToolUse") \
+                and e.get("matcher") != "Bash":
             continue
         for h in e.get("hooks", []):
             if "agent-guard" in (h.get("command", "") or ""):
@@ -203,13 +235,18 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="agent-guard",
         description="Behavior-guardrail hooks for Claude Code: "
-                    "test-tampering + outbound-action guards.")
+                    "test-tampering + outbound-action guards, mutation "
+                    "test-honesty, and post-exec verification.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     for name, help_text, func in [
         ("hook-snapshot", "SessionStart hook: snapshot test digests.", cmd_snapshot),
         ("hook-test", "Stop hook: block tests-only changes.", cmd_test),
         ("hook-outbound", "PreToolUse hook: block risky Bash actions.", cmd_outbound),
+        ("hook-verify", "PostToolUse hook: warn when a claimed effect "
+                        "isn't visible (never blocks).", cmd_verify),
+        ("mutate-check", "Mutation test-honesty check: mutate assertions, "
+                         "re-run tests, report survivors.", cmd_mutate),
         ("install", "Install hooks into ~/.claude/settings.json.", cmd_install),
         ("log", "Show recent guard decisions.", cmd_log),
         ("status", "Show state paths and config.", cmd_status),
@@ -217,11 +254,30 @@ def build_parser():
         sp = sub.add_parser(name, help=help_text)
         sp.set_defaults(func=func)
     sub.choices["log"].add_argument("--limit", type=int, default=20)
+    mc = sub.choices["mutate-check"]
+    mc.add_argument("test_file", help="test file to mutate")
+    mc.add_argument("test_cmd", nargs="*",
+                    help="test command (pass after -- : e.g. -- pytest -q)")
+    mc.add_argument("--project-root", default=None,
+                    help="project root (default: nearest dir with project markers)")
+    mc.add_argument("--max-mutations", type=int, default=mutate.DEFAULT_MAX_MUTATIONS)
+    mc.add_argument("--timeout", type=int, default=mutate.DEFAULT_TIMEOUT,
+                    help="per-mutation test command timeout in seconds")
     return p
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # argparse's REMAINDER greedily swallows optionals (e.g. --project-root
+    # ends up in test_cmd), so split the test command off at `--` manually.
+    tail = []
+    if "mutate-check" in argv and "--" in argv:
+        i = argv.index("--")
+        tail = argv[i + 1:]
+        argv = argv[:i]
     args = build_parser().parse_args(argv)
+    if getattr(args, "cmd", None) == "mutate-check":
+        args.test_cmd = tail
     return args.func(args)
 
 

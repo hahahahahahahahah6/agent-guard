@@ -1,7 +1,8 @@
 # agent-guard
 
 Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-Two guards, one install, zero dependencies (Python standard library only):
+Three guards plus a test-honesty CLI, one install, zero dependencies (Python
+standard library only):
 
 - **Test-tampering guard** — stops the "green by editing the test" cheat.
   On `SessionStart` it snapshots hashes of every test and source file; on
@@ -14,7 +15,17 @@ Two guards, one install, zero dependencies (Python standard library only):
   cloud provisioning (spend), and mass-send channels (Slack webhooks,
   mailers). Matches block with a named rule; a user allowlist in
   `config.json` overrides the denylist. Every matched decision is written to
-  an audit log.
+  an audit log. v0.2 also scans the *content* of script files the command
+  executes (`bash evil.sh`), closing the "write it to a script first" bypass.
+- **Post-exec read-back verifier** (v0.2) — a `PostToolUse` hook on `Bash`
+  that reads back world state after a command claimed an outbound effect
+  (`git push`, `npm publish`) and warns — never blocks — when the effect
+  isn't visible. Defense-in-depth on top of PreToolUse prevention: prevent
+  first, verify after.
+- **Mutation test-honesty checker** (v0.2) — `agent-guard mutate-check`
+  deliberately breaks assertions (regex-based mutants for JS/TS and Python),
+  re-runs the tests per mutant, and reports survivors: tests that stayed
+  green don't actually cover the bug.
 
 The failure modes are real, quoted from the community:
 
@@ -38,6 +49,61 @@ The failure modes are real, quoted from the community:
   edits (write-after-write on a file another session changed). agent-guard
   blocks *misbehaving* actions (weakened tests, unapproved outbound effects).
   Different failure modes, same fail-open hook philosophy.
+- **vs Kvitansiya** (Show HN, 2026-10-01): Kvitansiya verifies at stop —
+  it checks the claimed outcome once, when the session ends. agent-guard v0.2
+  adds post-exec read-back as defense-in-depth *on top of* PreToolUse
+  prevention: block the bad action before it happens, then verify the claimed
+  effect is actually visible afterwards. Prevent first, verify after.
+
+## v0.2: script-content inspection, mutation test-honesty, post-exec verification
+
+### Script-content inspection
+
+The Bash denylist failed as soon as the agent wrote the destructive command
+into a script and executed the script instead (`bash evil.sh`). The outbound
+guard now extracts script files from the command — `bash|sh|zsh|dash`,
+`python|node|ruby|perl|php <file>`, `./run.sh`, `source`/`. <file>`, plus
+`bash -c '...'` inline code — resolves them against the hook's cwd, and scans
+the file content with the same rule logic (regexes + destination-aware
+`git push` parsing). Hits block with a `script-content:<rule_id>` id so the
+audit log shows where the hit came from. Missing, unreadable, or >1MB files
+are skipped (fail open); only plausible script extensions are scanned; the
+user allowlist and `disabled_rules` apply to content hits too.
+
+### Mutation test-honesty checker
+
+```bash
+agent-guard mutate-check tests/test_app.py --project-root . -- pytest -q
+```
+
+Generates up to 20 syntactic mutations (default; `--max-mutations`), copies
+the project to a temp dir per mutant (skipping `.git`/`node_modules`/etc.),
+and runs the test command there. Mutation operators:
+
+- JS/TS: `toBe(<n>)` → `<n+1>`; `toEqual("<s>")` → `"<s>_mut"`;
+  `toBe(true)` ↔ `toBe(false)`; `===` → `!==` on `expect()` lines
+- Python: `assert <e> == <n>` → `<n+1>`; `assert <e> != <n>` → `==`;
+  `assert <name>` → `assert not <name>`
+
+A mutation the test suite still passes is **SURVIVED** — the assertion doesn't
+cover the bug — and the command exits 1. All killed → exit 0. Inconclusive
+runs (command missing, timeout) are reported separately and never count as
+survived. Weird input fails open with a warning.
+
+### Post-exec read-back verifier
+
+`install` registers `agent-guard hook-verify` as a `PostToolUse` hook on
+`Bash`. After a command that claimed an outbound effect, it reads back world
+state and warns on stderr (always exit 0 — it never blocks):
+
+- `git push <remote> <ref>`: runs `git ls-remote <remote> <ref>` (10s
+  timeout); warns when the ref is absent remotely. `<remote>` defaults to
+  `origin`; `-C <dir>` is honored; unreachable remotes stay silent.
+- `npm publish`: reads `name`/`version` from `package.json` and runs
+  `npm view <name>@<version> version`; warns when the version isn't visible.
+  Silent when there is no `package.json` or npm is missing.
+
+Warnings are audit-logged (`guard: verify`, `decision: warn`).
 
 ## Install
 
@@ -49,12 +115,14 @@ pip install .
 agent-guard install
 ```
 
-`install` merges three hook entries into `~/.claude/settings.json` (backing it
+`install` merges four hook entries into `~/.claude/settings.json` (backing it
 up first, never clobbering existing settings):
 
 - `SessionStart` → `agent-guard hook-snapshot` (records digests, never blocks)
 - `Stop` → `agent-guard hook-test` (blocks tests-only changes)
 - `PreToolUse` on `Bash` → `agent-guard hook-outbound` (blocks denylisted actions)
+- `PostToolUse` on `Bash` → `agent-guard hook-verify` (warns when a claimed
+  effect isn't visible; never blocks)
 
 Restart Claude Code afterwards. No MCP server, no daemon, no accounts.
 
@@ -118,8 +186,14 @@ allowed rather than breaking your workflow.
 Inspect decisions:
 
 ```bash
-agent-guard log        # blocked + allowlist-override decisions
+agent-guard log        # blocked + allowlist-override + verify-warn decisions
 agent-guard status     # state paths, mode, active rules
+```
+
+Check whether your tests are honest:
+
+```bash
+agent-guard mutate-check tests/test_billing.py -- pytest -q
 ```
 
 ## Honest limitations
@@ -142,20 +216,29 @@ agent-guard status     # state paths, mode, active rules
 - The hooks **fail open**: corrupt state, unreadable files, malformed input —
   anything unexpected means "allow". A guard that wedges your session is
   worse than no guard.
+- **Script-content inspection is one level deep.** A script that executes
+  another script (`bash a.sh` where `a.sh` runs `bash b.sh`) is not followed;
+  exotic interpreter wrappers beyond `env`/`sudo`/`nohup`/`time`/`nice` are
+  not unwrapped. The denylist is a seatbelt, not a vault.
+- **Mutation checking is regex-based, not semantic.** It generates at most 20
+  first-order mutants with simple syntactic operators — good enough to catch
+  vacuous assertions, not a replacement for real mutation-testing tools.
+- **The post-exec verifier is advisory.** It warns on stderr and always exits
+  0; unreachable remotes, missing npm, and timed-out checks stay silent
+  rather than crying wolf.
 
 ## Roadmap
 
 - **Comment-slop guard**: intercept the agent dumping conversation state into
   code comments (the "9 out of 10 of my revisions is deleting comments"
   complaint), or a one-command decomment pass before PRs.
-- **Test-honesty hook**: automate the mutation idea — deliberately break an
-  assertion, run once, require red; intercept "all green" reports from tests
-  that can't fail.
+- ~~**Test-honesty hook**: automate the mutation idea — deliberately break an
+  assertion, run once, require red~~ — shipped in v0.2 as `mutate-check`.
 
 ## Development
 
 ```bash
-python3 tests/test_agent_guard.py   # 13 smoke tests
+python3 tests/test_agent_guard.py   # 33 smoke tests
 ```
 
 ## License

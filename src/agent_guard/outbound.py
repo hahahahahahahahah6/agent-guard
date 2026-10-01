@@ -11,6 +11,7 @@ Everything fails open: any unexpected error means "allow".
 import os
 import re
 import shlex
+import stat
 import subprocess
 
 # (rule_id, human description, [regexes])
@@ -300,13 +301,249 @@ def check(command, config=None, cwd=None):
     Returns (allowed: bool, reason: str, rule_id or None).
     allowed-by-allowlist returns (True, "", "allowlist:<pattern>").
     `cwd` is the hook's working directory, used to resolve the current
-    branch for destination-aware `git push` checks.
+    branch for destination-aware `git push` checks and to resolve
+    relative script paths for script-content inspection.
     Never raises.
     """
     try:
         return _check_inner(command or "", config or {}, cwd)
     except Exception:
         return True, "", None  # fail open
+
+
+# ---------------------------------------------------------------------------
+# script-content inspection
+# ---------------------------------------------------------------------------
+# Adversarial case this closes: the Bash denylist is bypassed as soon as the
+# agent writes the destructive command into a script file and executes the
+# script instead (`bash evil.sh`). When a command runs a script, the script's
+# FILE CONTENT is scanned with the same rule logic; hits get a
+# "script-content:<rule_id>" id so the audit log shows where the hit came
+# from. One level only (a script executing another script is not followed).
+
+_SCRIPT_EXTS = {".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs",
+                ".ts", ".rb", ".pl", ".php"}
+_MAX_SCRIPT_BYTES = 1024 * 1024  # skip files >1MB: fail open
+
+_INTERPRETERS = {"bash", "sh", "zsh", "dash", "python", "python2",
+                 "python3", "node", "nodejs", "ruby", "perl", "php"}
+# Interpreter options whose next token is inline code, not a file.
+_INLINE_CODE_OPTS = {"-c", "-e", "-p"}
+# Interpreter options whose next token is a module name, not a file.
+_MODULE_OPTS = {"-m"}
+# Wrappers that may precede the real command (env FOO=1 ./run.sh).
+_EXEC_PREFIXES = {"env", "sudo", "nohup", "time", "nice"}
+
+
+def _is_script_path(tok):
+    """A token in execution position that looks like a script file."""
+    try:
+        if not (tok.startswith("./") or tok.startswith("/") or "/" in tok):
+            return False
+        _, ext = os.path.splitext(tok)
+        return ext.lower() in _SCRIPT_EXTS
+    except Exception:
+        return False
+
+
+def _extract_script_refs(command):
+    """Find scripts a command executes.
+
+    Returns a list of ("file", path) or ("code", inline_code) refs.
+    Recognizes `bash|sh|zsh|dash|python|node|ruby|perl|php <file>`,
+    `./<file>` and `/path/<file>` with a script extension,
+    `source <file>`, and `. <file>`. Never raises.
+    """
+    refs = []
+    try:
+        chunks = re.split(r"[|;&]", command or "")
+    except Exception:
+        return refs
+    for chunk in chunks:
+        try:
+            toks = shlex.split(chunk, posix=True)
+        except ValueError:
+            try:
+                toks = chunk.split()
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if not toks:
+            continue
+        # Strip wrappers: env FOO=1 ./run.sh
+        while len(toks) > 1 and toks[0] in _EXEC_PREFIXES:
+            toks = toks[1:]
+        head = os.path.basename(toks[0])
+        if head in _INTERPRETERS:
+            i = 1
+            while i < len(toks):
+                t = toks[i]
+                if t in _INLINE_CODE_OPTS and i + 1 < len(toks):
+                    refs.append(("code", toks[i + 1]))
+                    break  # rest are $0 / args, not a script file
+                if t in _MODULE_OPTS:
+                    i += 2
+                    continue
+                if t.startswith("-") and t != "-":
+                    i += 1
+                    continue
+                refs.append(("file", t))
+                break  # first positional is the script
+        elif toks[0] in ("source", "."):
+            if len(toks) > 1 and not toks[1].startswith("-"):
+                refs.append(("file", toks[1]))
+        elif _is_script_path(toks[0]):
+            refs.append(("file", toks[0]))
+    return refs
+
+
+def _resolve_script(path_str, cwd):
+    """Absolute path of a readable, regular, <=1MB script file.
+
+    Returns None for missing/unreadable/oversized files (fail open).
+    Never raises.
+    """
+    try:
+        p = path_str
+        if not os.path.isabs(p):
+            p = os.path.join(cwd or os.getcwd(), p)
+        p = os.path.normpath(p)
+        st = os.stat(p)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_size == 0 or st.st_size > _MAX_SCRIPT_BYTES:
+            return None
+        _, ext = os.path.splitext(p)
+        if ext.lower() not in _SCRIPT_EXTS:
+            return None
+        return p
+    except Exception:
+        return None
+
+
+def _read_script(path):
+    """Script file content as text, or None when unreadable. Never raises."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _script_base_disabled(prefixed_rid, disabled):
+    """Disabling a base rule also disables its script-content variant."""
+    if prefixed_rid in disabled:
+        return True
+    if prefixed_rid.startswith("script-content:"):
+        return prefixed_rid[len("script-content:"):] in disabled
+    return False
+
+
+def _script_rule_desc(base_rid):
+    if base_rid == "git-push-protected":
+        return "Push to a protected branch (main/master/prod*/release/*)"
+    if base_rid == "git-push-force":
+        return ("Force push to a protected branch "
+                "(rewrites remote history)")
+    if base_rid.startswith("deny_extra:"):
+        return "user rule"
+    for rid, desc, _ in RULES:
+        if rid == base_rid:
+            return desc
+    return base_rid
+
+
+def _scan_text_rules(text, out, cwd):
+    """Scan arbitrary text with the same rule logic as the command string.
+
+    Returns (prefixed_rule_id, desc, detail) or (None, None, None).
+    Never raises.
+    """
+    try:
+        return _scan_text_rules_inner(text, out, cwd)
+    except Exception:
+        return None, None, None
+
+
+def _scan_text_rules_inner(text, out, cwd):
+    for pat in out.get("allow", []) or []:
+        try:
+            if re.search(pat, text, re.IGNORECASE):
+                return None, None, None
+        except re.error:
+            continue
+
+    rid, detail = _check_git_push(text, cwd)
+    if rid is not None:
+        return "script-content:" + rid, _script_rule_desc(rid), detail
+
+    for rid, _desc, rxs in _COMPILED:
+        try:
+            if any(rx.search(text) for rx in rxs):
+                return ("script-content:" + rid,
+                        _script_rule_desc(rid), None)
+        except Exception:
+            continue
+
+    for pat in out.get("deny_extra", []) or []:
+        try:
+            if re.search(pat, text, re.IGNORECASE):
+                base = "deny_extra:" + pat
+                return ("script-content:" + base,
+                        _script_rule_desc(base), None)
+        except re.error:
+            continue
+
+    return None, None, None
+
+
+def _check_script_content(command, out, cwd, disabled):
+    """Block when a script executed by the command contains a risky action.
+
+    Returns (allowed, reason, rule_id); allowed True when nothing found.
+    Never raises.
+    """
+    try:
+        return _check_script_content_inner(command, out, cwd, disabled)
+    except Exception:
+        return True, "", None  # fail open
+
+
+def _check_script_content_inner(command, out, cwd, disabled):
+    seen = set()
+    for kind, ref in _extract_script_refs(command):
+        if kind == "code":
+            text, origin = ref, "inline code"
+        else:
+            if not _is_script_path(ref) and os.path.splitext(ref)[1].lower() \
+                    not in _SCRIPT_EXTS:
+                # Interpreter arg without a script extension (e.g. -m mod,
+                # or a bare name): not a script file, skip.
+                continue
+            path = _resolve_script(ref, cwd)
+            if path is None or path in seen:
+                continue
+            seen.add(path)
+            text = _read_script(path)
+            if not text:
+                continue
+            origin = "script file '%s'" % path
+        rid, desc, detail = _scan_text_rules(text, out, cwd)
+        if rid is None or _script_base_disabled(rid, disabled):
+            continue
+        if detail:
+            what = "%s: %s" % (desc, detail)
+        else:
+            what = desc
+        reason = (
+            "Outbound-action guard blocked this command (rule '%s': %s; "
+            "matched inside %s executed by this command).\n"
+            "If this action is intended, add an allowlist regex to "
+            "outbound.allow in %s, or run it yourself outside the agent."
+            % (rid, what, origin, _config_hint()))
+        return False, reason, rid
+    return True, "", None
 
 
 def _check_inner(command, config, cwd):
@@ -345,6 +582,12 @@ def _check_inner(command, config, cwd):
                 "outbound.allow in %s, or run it yourself outside the agent."
                 % (rid, desc, _config_hint()))
             return False, reason, rid
+
+    # Script-content inspection: a denylisted action smuggled into a script
+    # file (`bash evil.sh`) is blocked with a script-content:<rule> id.
+    allowed, reason, rid = _check_script_content(command, out, cwd, disabled)
+    if not allowed:
+        return False, reason, rid
 
     for pat in out.get("deny_extra", []) or []:
         try:
