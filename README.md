@@ -1,7 +1,7 @@
 # agent-guard
 
 Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-Four guards plus a test-honesty CLI, one install, zero dependencies (Python
+Five guards plus test-honesty CLIs, one install, zero dependencies (Python
 standard library only):
 
 - **Test-tampering guard** — stops the "green by editing the test" cheat.
@@ -33,6 +33,13 @@ standard library only):
   docstrings that just restate the signature. Blocks at a configurable
   threshold, or `agent-guard decomment --check/--fix` for a one-command
   decomment pass before PRs.
+- **Cheat-sniffing guard** (v0.4) — catches the cheating that never touches
+  test files: RNG rigging (`random.seed(123)` with no reproducibility
+  marker, patching `random.shuffle`), mocking the function under test
+  instead of its collaborators, `conftest.py` plants, time-freezing, and
+  always-True comparison dunders. A `PreToolUse` hook on `Write`/`Edit`
+  blocks cheat patterns in added test text; `agent-guard cheatsniff
+  --check` audits the repo.
 
 The failure modes are real, quoted from the community:
 
@@ -61,6 +68,46 @@ The failure modes are real, quoted from the community:
   adds post-exec read-back as defense-in-depth *on top of* PreToolUse
   prevention: block the bad action before it happens, then verify the claimed
   effect is actually visible afterwards. Prevent first, verify after.
+
+## v0.4: cheat-sniffing beyond test files
+
+```bash
+agent-guard cheatsniff --check tests/    # per-file cheat scores, exit 1 over threshold
+```
+
+Half of agent cheating never touches a test file. A dev.to study (remdore,
+2026-10-01, 102 runs × 4 models) found agents patching the RNG *"so the list
+would always be sorted"*, mocking the function under test instead of its
+collaborators, and planting helpers in `conftest.py`. The test-tampering
+guard (tests-only-change diff) and `mutate-check` (assertion mutation) both
+miss this family — "restore the test files and re-run" only catches the
+dumb half.
+
+`install` registers `agent-guard hook-cheatsniff` as a `PreToolUse` hook on
+`Write`/`Edit`. It fires only for test-ish files (`test_*.py`,
+`*_test.py`, `conftest.py`, anything under `tests/`) and scores only the
+*added* text. Six cheat kinds, regex-based and deliberately conservative:
+
+- **mock-subject** (severe): `mock.patch("billing.total")` inside
+  `test_billing.py` — patching the module under test itself, not its
+  dependencies. Patching a collaborator (`stripe.Charge.create`) is clean.
+- **rng-patch** (severe): patching `random.shuffle` / `random.random` /
+  `random.sample` to force outcomes.
+- **conftest-patch** (severe): `conftest.py` monkeypatching the subject or
+  other local modules — including hand-rolled `mymod.shuffle = ...` direct
+  assignment (pure fixtures are clean).
+- **rng-seed**: a fixed `random.seed(123)` with no reproducibility marker.
+  `random.seed(42)` next to a "reproducible" comment is legitimate and not
+  flagged — the marker is the whole difference, and it's documented.
+- **time-freeze**: `freeze_time(...)`, `time.sleep` patched to a no-op.
+- **weak-comparator**: a `__eq__` / `__lt__` / … whose body unconditionally
+  `return True`.
+
+One severe hit reaches the default threshold (30/100) on its own. Warn mode
+(`AGENT_GUARD_CHEAT_MODE=warn` or `cheat_sniff.mode=warn` in config) advises
+instead of blocking. A `cheat_sniff.allow` list (`"test_sort.py:rng-seed"`,
+`"*/legacy/*:*")` covers the judgment calls you disagree with. Everything
+fails open.
 
 ## v0.3: comment-slop guard
 
@@ -216,6 +263,11 @@ allowed rather than breaking your workflow.
   "comment_slop": {
     "mode": "block",
     "threshold": 30
+  },
+  "cheat_sniff": {
+    "mode": "block",
+    "threshold": 30,
+    "allow": []
   }
 }
 ```
@@ -226,6 +278,13 @@ allowed rather than breaking your workflow.
   `AGENT_GUARD_COMMENT_MODE=warn`.
 - `comment_slop.threshold`: slop score (0–100) at which the comment hook
   trips. Env override: `AGENT_GUARD_COMMENT_THRESHOLD`.
+- `cheat_sniff.mode`: `"block"` (default) or `"warn"`. Env override:
+  `AGENT_GUARD_CHEAT_MODE=warn`.
+- `cheat_sniff.threshold`: cheat score (0–100) at which the cheat hook
+  trips (one severe hit reaches the default 30). Env override:
+  `AGENT_GUARD_CHEAT_THRESHOLD`.
+- `cheat_sniff.allow`: `"path-or-basename:kind"` entries that suppress hits,
+  e.g. `"test_sort.py:rng-seed"` or `"*/legacy/*:*"`.
 - `outbound.allow`: regexes that win over the denylist (e.g. your internal
   registry). Every override is audit-logged.
 - `outbound.deny_extra` / `disabled_rules`: extend or trim the denylist.
@@ -283,9 +342,23 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
 - **`decomment --fix` only removes commented-out code.** Other slop kinds
   are reported, never auto-edited — deleting prose automatically is how you
   lose the one comment that mattered.
+- **Cheat-sniffing is static and Python-first.** It reads text, not runtime
+  behavior — a cheat applied only at runtime (e.g. via `sitecustomize.py`
+  or an installed plugin) is invisible to it. The "subject vs collaborator"
+  judgment is a filename heuristic (`test_billing.py` → `billing`); exotic
+  layouts need the allowlist. A fixed seed with a reproducibility marker is
+  trusted on the marker's word — an agent that writes "reproducible" next
+  to a planted seed fools the exemption, which is why severe kinds
+  (mock-subject, rng-patch, conftest-patch) have no marker exemption at all.
+- **The cheat hook only watches added test text.** Pre-existing cheats in
+  the repo are found by `cheatsniff --check`, not blocked by the hook.
 
 ## Roadmap
 
+- ~~**Cheat-sniffing beyond test files**: catch RNG rigging, subject-mocking,
+  and conftest plants (the remdore study: half of cheating never touches
+  test files).~~ — shipped in v0.4 as `hook-cheatsniff` +
+  `cheatsniff --check`.
 - ~~**Comment-slop guard**: intercept the agent dumping conversation state into
   code comments (the "9 out of 10 of my revisions is deleting comments"
   complaint), or a one-command decomment pass before PRs.~~ — shipped in v0.3
@@ -296,7 +369,8 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
 ## Development
 
 ```bash
-python3 tests/test_agent_guard.py   # 33 smoke tests
+python3 tests/test_agent_guard.py   # 47 smoke tests
+python3 tests/test_cheatsniff.py    # 26 cheat-sniff tests
 ```
 
 ## License
