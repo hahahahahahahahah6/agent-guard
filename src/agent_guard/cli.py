@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 
-from . import cheatsniff, commentslop, mutate, outbound, state, testguard, verify
+from . import bashwrite, cheatsniff, commentslop, mutate, outbound, state, testguard, verify
 
 
 def _hook_input():
@@ -391,6 +391,51 @@ def cmd_hook_cheatsniff(args):
         return 0  # fail open, always
 
 
+def cmd_hook_bashwrite(args):
+    """PreToolUse on Bash: block file writes that bypass Edit/Write hooks.
+
+    Extracts write targets (redirections, heredocs, sed -i, tee, cp/mv)
+    from the Bash command and applies the same policy the Write-tool
+    guards would apply: test-ish targets get cheat-sniffed when the
+    content is visible (heredoc), opaque writes to protected files are
+    treated as violations. Blocks (exit 2) in block mode, warns (exit 0)
+    in warn mode. Fails open on everything.
+    """
+    try:
+        data = _hook_input()
+        if data.get("tool_name", "") != "Bash":
+            return 0
+        tool_input = data.get("tool_input")
+        command = tool_input.get("command", "") \
+            if isinstance(tool_input, dict) else ""
+        if not command or not str(command).strip():
+            return 0
+        session = str(data.get("session_id", "") or "unknown")
+        cwd = data.get("cwd") or os.getcwd()
+        cfg = state.load_config()
+        ok, reason, targets, parse_ok = bashwrite.decide(command, cfg, cwd)
+        if not parse_ok:
+            sys.stderr.write("bashwrite: could not parse command; "
+                             "allowing (fail-open).\n")
+        if ok:
+            return 0
+        state.append_audit({
+            "guard": "bashwrite", "tool": "Bash", "session": session,
+            "command": str(command)[:500],
+            "targets": [str(t)[:200] for t in targets][:10],
+            "decision": "blocked" if bashwrite.mode(cfg) == "block"
+                        else "warn",
+            "reason": reason.split("\n")[0],
+        })
+        if bashwrite.mode(cfg) == "warn":
+            sys.stderr.write("WARNING (not blocking): " + reason + "\n")
+            return 0
+        sys.stderr.write(reason + "\n")
+        return 2
+    except Exception:
+        return 0  # fail open, always
+
+
 SNIPPETS = {
     "SessionStart": [{"hooks": [{"type": "command",
                                  "command": "agent-guard hook-snapshot"}]}],
@@ -399,6 +444,9 @@ SNIPPETS = {
     "PreToolUse": [{"matcher": "Bash",
                     "hooks": [{"type": "command",
                                "command": "agent-guard hook-outbound"}]},
+                   {"matcher": "Bash",
+                    "hooks": [{"type": "command",
+                               "command": "agent-guard hook-bashwrite"}]},
                    {"matcher": "Write|Edit",
                     "hooks": [{"type": "command",
                                "command": "agent-guard hook-commentslop"}]},
@@ -500,6 +548,7 @@ def cmd_status(args):
           % (commentslop.mode(), commentslop.threshold()))
     print("cheat mode:   %s (threshold %.1f)"
           % (cheatsniff.mode(), cheatsniff.threshold()))
+    print("bash-write mode: %s" % bashwrite.mode())
     print("rules:      %s" % ", ".join(outbound.rule_ids()))
     print("settings:   %s" % _settings_path())
     return 0
@@ -510,8 +559,8 @@ def build_parser():
         prog="agent-guard",
         description="Behavior-guardrail hooks for Claude Code: "
                     "test-tampering + outbound-action + comment-slop + "
-                    "cheat-sniffing guards, mutation test-honesty, and "
-                    "post-exec verification.")
+                    "cheat-sniffing + cross-tool-write guards, mutation "
+                    "test-honesty, and post-exec verification.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     for name, help_text, func in [
@@ -525,6 +574,9 @@ def build_parser():
         ("hook-cheatsniff", "PreToolUse hook: block cheat patterns (RNG rig, "
                              "subject-mocking, conftest plants) in added "
                              "test text.", cmd_hook_cheatsniff),
+        ("hook-bashwrite", "PreToolUse hook: block Bash file writes "
+                           "(sed -i, heredocs, redirections) that bypass "
+                           "the Edit/Write hooks.", cmd_hook_bashwrite),
         ("cheatsniff", "Scan test files for cheating that never touches "
                        "test assertions.", cmd_cheatsniff),
         ("mutate-check", "Mutation test-honesty check: mutate assertions, "
