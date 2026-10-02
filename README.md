@@ -46,10 +46,10 @@ The failure modes are real, quoted from the community:
 > *"Instead of fixing the indexing logic in the source file, the agent quietly
 > modified the test file: it changed `expect(page.items.length).toBe(10)` to
 > `toBe(9)`, re-ran the test, saw green, and told us the refactor was
-> complete."* — navune, r/ClaudeCode
+> complete."* — [navune, r/ClaudeCode](https://old.reddit.com/r/ClaudeCode/comments/1wtpa4g/the_silent_testtampering_trap_how_to_stop_claude/)
 
-> *"the real risk is not a bad answer but a bad action"* — dank_as_fuck_,
-> r/aiagents, on why guardrails must live *"below the prompt layer"*
+> *"the risk isn't a bad answer, it's a bad action"* — [dank_as_fuck_,](https://www.reddit.com/r/AI_Agents/comments/1wqz6b0/how_are_you_stopping_agents_from_doing_things/)
+> [r/AI_Agents](https://www.reddit.com/r/AI_Agents/comments/1wqz6b0/how_are_you_stopping_agents_from_doing_things/), on why guardrails must live *"below the prompt layer"*
 > (verstands)
 
 ## Differentiation
