@@ -49,6 +49,22 @@ _SKIP_TARGETS = frozenset({
 # `sed -i` / `tee` / `cp` / `mv` / `install` write targets
 _SED_CMDS = ("sed", "gsed")
 
+# file basenames that are never test files, even under tests/
+_NONTEST_BASENAMES = frozenset({"__init__.py"})
+
+# directory segments whose contents are data, not code
+_DATA_DIR_SEGS = frozenset({
+    "fixtures", "testdata", "data", "snapshots", "__snapshots__",
+})
+
+# real code suffixes: only these can be test files for the Bash guard
+_CODE_EXTS = frozenset({
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".rb", ".php", ".t",
+    ".cs", ".swift", ".kt", ".kts", ".scala",
+    ".c", ".h", ".cpp", ".hpp",
+})
+
 
 def _strip_heredocs(command):
     """Replace heredoc bodies; return (command_without_bodies, [bodies]).
@@ -217,6 +233,50 @@ def _sed_target(seg):
         return None
 
 
+_PERL_FLAG_RX = re.compile(r"^-[A-Za-z]+(\.\w+)?$")
+
+
+def _is_perl_inplace(args):
+    """perl edits in place when a combined short-flag token contains `i`:
+    `-i`, `-pi`, `-pie`, `-pi.bak`. Never raises."""
+    try:
+        for t in args:
+            if not t.startswith("-") or t.startswith("--"):
+                continue
+            letters = t[1:].split(".", 1)[0]
+            if letters.isalpha() and "i" in letters:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _perl_target(seg):
+    """Target of `perl -pi -e ... file` (in-place edit). None when
+    stdin/no file. Never raises."""
+    try:
+        toks = list(seg[1:])
+        cleaned = []
+        skip_next = False
+        for t in toks:
+            if skip_next:
+                skip_next = False
+                continue
+            if t in ("-e", "--execute"):
+                skip_next = True
+                continue
+            if _PERL_FLAG_RX.fullmatch(t):
+                continue
+            cleaned.append(t)
+        cands = [t for t in cleaned
+                 if not t.startswith("-") and _confident_target(t)]
+        if not cands:
+            return None
+        return cands[-1]
+    except Exception:
+        return None
+
+
 def _flagless_targets(seg, min_args=1):
     """Non-flag args of cp/mv/install/tee. For cp/mv the dest is last.
 
@@ -309,6 +369,11 @@ def _extract_inner(command):
             target = _sed_target(plain)
             if target:
                 add(target, "sed -i")
+        elif cmd == "perl" and _is_perl_inplace(plain[1:]):
+            # perl -pi -e is sed -i's exact equivalent; treat it the same
+            target = _perl_target(plain)
+            if target:
+                add(target, "perl -i")
         elif cmd == "tee":
             for t in _flagless_targets(plain):
                 add(t, "tee")
@@ -328,10 +393,21 @@ def _extract_inner(command):
 # ---------------------------------------------------------------------------
 
 def _is_testy(rel):
-    """Mirror of the Write-hook's test-file definition. Never raises."""
+    """Mirror of the Write-hook's test-file definition, tightened for the
+    Bash guard (v0.5.1): only real code files count as test files, and
+    fixture/data dirs plus __init__.py never do. v0.5 blocked
+    `tee test_output.log` and writes under tests/fixtures/ — a hook that
+    cries wolf gets uninstalled. Never raises."""
     try:
         p = str(rel or "").replace("\\", "/")
         base = p.rsplit("/", 1)[-1]
+        if base in _NONTEST_BASENAMES:
+            return False
+        if any(s in _DATA_DIR_SEGS for s in p.split("/")):
+            return False
+        _, ext = os.path.splitext(base)
+        if ext.lower() not in _CODE_EXTS:
+            return False
         if base == "conftest.py" or base.startswith("test_") \
                 or base.endswith("_test.py") or "/tests/" in p:
             return True
@@ -484,7 +560,7 @@ def _decide_inner(command, cfg, cwd):
         "%s\n"
         "A guardrail on one tool protects nothing if another tool can do "
         "the same thing: blocked Write/Edit calls are bypassed with "
-        "`sed -i`, heredocs, and redirections. Make the change with the "
+        "`sed -i` / `perl -pi`, heredocs, and redirections. Make the change with the "
         "Edit tool instead, where the content is scored.\n"
         "Bypass (not recommended): AGENT_GUARD_BASHWRITE_MODE=warn, or "
         "bash_write.mode=warn in CONFIG_PATH."

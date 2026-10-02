@@ -294,6 +294,77 @@ def test_config_merge_includes_sections():
 
 
 # ---------------------------------------------------------------------------
+# regression (v0.5.1): false positives — the hook blocked things that are
+# not test files. Only real code suffixes count as test files; fixture /
+# data dirs and __init__.py never do.
+# ---------------------------------------------------------------------------
+
+def test_fp_log_file_not_testy():
+    cfg = state.default_config()
+    ok, _, _, _ = bashwrite.decide(
+        "pytest -q 2>&1 | tee test_output.log", cfg, "/tmp/proj")
+    check("FP: test_*.log is not a test file", ok is True, ok)
+
+
+def test_fp_fixture_data_not_testy():
+    cfg = state.default_config()
+    ok, _, _, _ = bashwrite.decide(
+        "echo '{}' > tests/fixtures/data.json", cfg, "/tmp/proj")
+    check("FP: tests/fixtures/ data is not a test file", ok is True, ok)
+
+
+def test_fp_testdata_dir_not_testy():
+    cfg = state.default_config()
+    ok, _, _, _ = bashwrite.decide(
+        "echo x > tests/testdata/case1.json", cfg, "/tmp/proj")
+    check("FP: tests/testdata/ is not a test file", ok is True, ok)
+
+
+def test_fp_init_py_not_testy():
+    cfg = state.default_config()
+    ok, _, _, _ = bashwrite.decide(
+        "echo '' > tests/__init__.py", cfg, "/tmp/proj")
+    check("FP: tests/__init__.py is not a test file", ok is True, ok)
+
+
+def test_fp_real_test_file_still_blocked():
+    cfg = state.default_config()
+    ok, _, _, _ = bashwrite.decide(
+        "echo x > tests/test_x.py", cfg, "/tmp/proj")
+    check("real test file still blocked", ok is False, ok)
+
+
+# ---------------------------------------------------------------------------
+# regression (v0.5.1): perl -i is sed -i's exact equivalent and must be
+# treated the same way
+# ---------------------------------------------------------------------------
+
+def test_perl_inplace_extracts():
+    got, _ = got_of("perl -pi -e 's/a/b/' tests/test_x.py")
+    check("perl -pi -e extracts file",
+          got == [("tests/test_x.py", "perl -i")], got)
+
+
+def test_perl_inplace_bak_extracts():
+    got, _ = got_of("perl -pi.bak -e 's/a/b/' tests/test_x.py")
+    check("perl -pi.bak extracts file",
+          got == [("tests/test_x.py", "perl -i")], got)
+
+
+def test_perl_no_inplace_no_target():
+    got, _ = got_of("perl -pe 's/a/b/' tests/test_x.py")
+    check("perl without -i has no write target", got == [], got)
+
+
+def test_perl_inplace_on_test_file_blocked():
+    cfg = state.default_config()
+    ok, reason, _, _ = bashwrite.decide(
+        "perl -pi -e 's/a/b/' tests/test_x.py", cfg, "/tmp/proj")
+    check("perl -pi -e on test file blocked",
+          ok is False and "tests/test_x.py" in reason, (ok, reason[:80]))
+
+
+# ---------------------------------------------------------------------------
 # hook: subprocess end-to-end
 # ---------------------------------------------------------------------------
 
@@ -474,6 +545,15 @@ def main():
     test_decide_allowlist()
     test_decide_mode_warn()
     test_config_merge_includes_sections()
+    test_fp_log_file_not_testy()
+    test_fp_fixture_data_not_testy()
+    test_fp_testdata_dir_not_testy()
+    test_fp_init_py_not_testy()
+    test_fp_real_test_file_still_blocked()
+    test_perl_inplace_extracts()
+    test_perl_inplace_bak_extracts()
+    test_perl_no_inplace_no_target()
+    test_perl_inplace_on_test_file_blocked()
     test_hook_blocks_sed_on_test_file()
     test_hook_blocks_heredoc_cheat()
     test_hook_ignores_readonly()

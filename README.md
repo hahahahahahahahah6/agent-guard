@@ -76,6 +76,27 @@ The failure modes are real, quoted from the community:
   prevention: block the bad action before it happens, then verify the claimed
   effect is actually visible afterwards. Prevent first, verify after.
 
+## v0.5.1: fewer false positives, perl -i
+
+Patch release driven by an independent review of v0.5 — every item below
+was reproduced against the release before fixing:
+
+- **False positives fixed.** The Bash guard blocked
+  `pytest -q 2>&1 | tee test_output.log`,
+  `echo '{}' > tests/fixtures/data.json`, and
+  `echo '' > tests/__init__.py`. A hook that cries wolf gets uninstalled:
+  only real code suffixes now count as test files, and `fixtures/`,
+  `testdata/`, `data/` directories plus `__init__.py` are never test
+  files. Regression-tested per reported case.
+- **`perl -pi -e` is now treated like `sed -i`.** It is the exact
+  equivalent and sailed through v0.5; opaque in-place edits of test files
+  via perl are blocked the same way.
+- **Honest coverage table** in Honest limitations: `awk -i inplace`,
+  `truncate -s 0`, `dd of=`, and `git checkout … -- tests/` are not
+  intercepted by the PreToolUse hook — but the Stop-time test-tampering
+  guard still catches any test-file modification or deletion at session
+  end (verified by test).
+
 ## v0.5: cross-tool write guard
 
 ```bash
@@ -398,6 +419,15 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
 - **`decomment --fix` only removes commented-out code.** Other slop kinds
   are reported, never auto-edited — deleting prose automatically is how you
   lose the one comment that mattered.
+- **Bash-write coverage is enumerated, not exhaustive.** The PreToolUse
+  hook intercepts `>` / `>>` / heredocs / `sed -i` / `perl -pi -e` /
+  `tee` / `cp` / `mv` / `install`. It does *not* intercept
+  `awk -i inplace`, `truncate -s 0`, `dd of=`, or
+  `git checkout … -- tests/` — those write to test files without tripping
+  the hook. Defense in depth: the Stop-time test-tampering guard diffs
+  every test file against the session snapshot and blocks the stop when
+  test files changed but no source file did, so the damage is still caught
+  at session end (covered by regression tests). A seatbelt, not a vault.
 - **Cheat-sniffing is static and Python-first.** It reads text, not runtime
   behavior — a cheat applied only at runtime (e.g. via `sitecustomize.py`
   or an installed plugin) is invisible to it. The "subject vs collaborator"
@@ -441,10 +471,14 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
 ## Development
 
 ```bash
-python3 tests/test_agent_guard.py   # 47 smoke tests
-python3 tests/test_cheatsniff.py    # 29 cheat-sniff tests
-python3 tests/test_bashwrite.py     # bash write-target extraction + hook tests
+python3 tests/test_agent_guard.py   # 49 script checks
+python3 tests/test_cheatsniff.py    # 29 script checks
+python3 tests/test_bashwrite.py     # 64 script checks
+python3 -m pytest tests/            # 75 pytest tests
 ```
+
+142 script checks + 75 pytest tests = 217 total, all passing, still zero
+dependencies.
 
 ## License
 

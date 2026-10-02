@@ -133,6 +133,29 @@ def main():
         code, _, _ = stop_check(proj, sd)
         check("no change -> allowed", code == 0, "rc=%d" % code)
 
+    # --- regression (v0.5.1): PreToolUse can't see rm / git checkout, but
+    # the Stop guard diffs test files against the session snapshot, so
+    # test-file deletion or content reverts are still caught at stop time.
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)
+        os.remove(os.path.join(proj, "tests", "test_app.py"))  # rm
+        code, _, err = stop_check(proj, sd)
+        check("deleted test file blocked at stop",
+              code == 2 and "test_app.py" in err, "rc=%d" % code)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = os.path.join(tmp, "state")
+        proj = make_proj(tmp)
+        snapshot(proj, sd)
+        # simulate: git checkout HEAD~1 -- tests/test_app.py
+        with open(os.path.join(proj, "tests", "test_app.py"), "w") as fh:
+            fh.write("def test_old():\n    assert True\n")
+        code, _, err = stop_check(proj, sd)
+        check("reverted test file blocked at stop",
+              code == 2 and "test_app.py" in err, "rc=%d" % code)
+
     with tempfile.TemporaryDirectory() as tmp:
         sd = os.path.join(tmp, "state")
         proj = make_proj(tmp)
