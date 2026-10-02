@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 
-from . import commentslop, mutate, outbound, state, testguard, verify
+from . import cheatsniff, commentslop, mutate, outbound, state, testguard, verify
 
 
 def _hook_input():
@@ -271,6 +271,126 @@ def _settings_path():
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 
 
+def _testy_path(path):
+    """Does this file look like a test/support file? Never raises."""
+    try:
+        p = str(path or "")
+        base = os.path.basename(p)
+        return (base == "conftest.py"
+                or base.startswith("test_")
+                or base.endswith("_test.py")
+                or "/tests/" in p.replace("\\", "/"))
+    except Exception:
+        return False
+
+
+def _cheatsniff_check(paths, threshold):
+    """Print per-file cheat scores; exit 1 if any file hits the threshold."""
+    try:
+        cfg = state.load_config()
+        bad = 0
+        for root in paths:
+            for path, score, hits in cheatsniff.scan_path(root):
+                hits = cheatsniff.filter_allowed(hits, cfg, path)
+                score = min(100.0, 10.0 * sum(
+                    cheatsniff.WEIGHTS.get(k, 1.0) for _, _, k, _ in hits))
+                score = round(score, 1)
+                flag = "CHEAT?" if score >= threshold else "ok"
+                print("%s: score %.1f (%d hits) [%s]" % (path, score,
+                                                        len(hits), flag))
+                for ln, end_ln, kind, excerpt in hits[:10]:
+                    loc = "L%d" % ln if ln == end_ln else "L%d-%d" % (ln, end_ln)
+                    print("  %s [%s] %s" % (loc, kind, excerpt))
+                if score >= threshold:
+                    bad += 1
+        if bad:
+            print("%d file(s) at or above the cheat threshold (%.1f)."
+                  % (bad, threshold))
+            return 1
+        return 0
+    except Exception as e:
+        sys.stderr.write("cheatsniff: internal error (%s); failing open.\n"
+                         % e)
+        return 0
+
+
+def cmd_cheatsniff(args):
+    """Scan test files for non-test-file cheating (RNG/mocks/conftest)."""
+    try:
+        cfg = state.load_config()
+        threshold = args.threshold
+        if threshold is None:
+            threshold = cheatsniff.threshold(cfg)
+        return _cheatsniff_check(args.paths, threshold)
+    except Exception as e:
+        sys.stderr.write("cheatsniff: internal error (%s); failing open.\n"
+                         % e)
+        return 0
+
+
+def cmd_hook_cheatsniff(args):
+    """PreToolUse on Write/Edit: block cheat patterns in added test text.
+
+    Only fires for test-ish files (test_*.py, conftest.py, ...). Scores the
+    ADDED text only — pre-existing code is not punished. Blocks (exit 2) in
+    block mode, warns (exit 0) in warn mode. Fails open on everything.
+    """
+    try:
+        data = _hook_input()
+        tool = data.get("tool_name", "")
+        if tool not in ("Write", "Edit"):
+            return 0
+        tool_input = data.get("tool_input")
+        if not isinstance(tool_input, dict):
+            return 0
+        session = str(data.get("session_id", "") or "unknown")
+        path = tool_input.get("file_path") or ""
+        if not _testy_path(path):
+            return 0
+        added = _added_text(tool, tool_input)
+        if not added.strip():
+            return 0
+        cfg = state.load_config()
+        score, hits = cheatsniff.score_text(added, path)
+        hits = cheatsniff.filter_allowed(hits, cfg, path)
+        score = min(100.0, 10.0 * sum(
+            cheatsniff.WEIGHTS.get(k, 1.0) for _, _, k, _ in hits))
+        score = round(score, 1)
+        threshold = cheatsniff.threshold(cfg)
+        if score < threshold:
+            return 0
+        lines = []
+        for ln, end_ln, kind, excerpt in hits[:8]:
+            loc = "L%d" % ln if ln == end_ln else "L%d-%d" % (ln, end_ln)
+            lines.append("  %s [%s] %s" % (loc, kind, excerpt))
+        reason = (
+            "Cheat-sniff guard: the %s is adding test code that looks like "
+            "cheating WITHOUT touching test assertions (score %.1f >= %.1f).\n"
+            "%s\n"
+            "Half of agent cheating never edits test files -- it rigs the "
+            "RNG, mocks the function under test, or plants helpers in "
+            "conftest.py. Fix the source instead.\n"
+            "Bypass (not recommended): AGENT_GUARD_CHEAT_MODE=warn, or "
+            "cheat_sniff.mode=warn in %s."
+            % (tool, score, threshold, "\n".join(lines),
+               state.config_path()))
+        state.append_audit({
+            "guard": "cheatsniff", "tool": tool, "session": session,
+            "file": str(path)[:200],
+            "decision": "blocked" if cheatsniff.mode(cfg) == "block"
+                        else "warn",
+            "score": score,
+            "reason": reason.split("\n")[0],
+        })
+        if cheatsniff.mode(cfg) == "warn":
+            sys.stderr.write("WARNING (not blocking): " + reason + "\n")
+            return 0
+        sys.stderr.write(reason + "\n")
+        return 2
+    except Exception:
+        return 0  # fail open, always
+
+
 SNIPPETS = {
     "SessionStart": [{"hooks": [{"type": "command",
                                  "command": "agent-guard hook-snapshot"}]}],
@@ -281,8 +401,10 @@ SNIPPETS = {
                                "command": "agent-guard hook-outbound"}]},
                    {"matcher": "Write|Edit",
                     "hooks": [{"type": "command",
-                               "command": "agent-guard hook-commentslop"}]}],
-    "PostToolUse": [{"matcher": "Bash",
+                               "command": "agent-guard hook-commentslop"}]},
+                   {"matcher": "Write|Edit",
+                    "hooks": [{"type": "command",
+                               "command": "agent-guard hook-cheatsniff"}]}],    "PostToolUse": [{"matcher": "Bash",
                      "hooks": [{"type": "command",
                                 "command": "agent-guard hook-verify"}]}],
 }
@@ -376,6 +498,8 @@ def cmd_status(args):
     print("test mode:  %s" % testguard.mode())
     print("comment mode: %s (threshold %.1f)"
           % (commentslop.mode(), commentslop.threshold()))
+    print("cheat mode:   %s (threshold %.1f)"
+          % (cheatsniff.mode(), cheatsniff.threshold()))
     print("rules:      %s" % ", ".join(outbound.rule_ids()))
     print("settings:   %s" % _settings_path())
     return 0
@@ -385,8 +509,9 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="agent-guard",
         description="Behavior-guardrail hooks for Claude Code: "
-                    "test-tampering + outbound-action + comment-slop guards, "
-                    "mutation test-honesty, and post-exec verification.")
+                    "test-tampering + outbound-action + comment-slop + "
+                    "cheat-sniffing guards, mutation test-honesty, and "
+                    "post-exec verification.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     for name, help_text, func in [
@@ -397,6 +522,11 @@ def build_parser():
                         "isn't visible (never blocks).", cmd_verify),
         ("hook-commentslop", "PreToolUse hook: block comment slop in "
                              "Write/Edit.", cmd_commentslop),
+        ("hook-cheatsniff", "PreToolUse hook: block cheat patterns (RNG rig, "
+                             "subject-mocking, conftest plants) in added "
+                             "test text.", cmd_hook_cheatsniff),
+        ("cheatsniff", "Scan test files for cheating that never touches "
+                       "test assertions.", cmd_cheatsniff),
         ("mutate-check", "Mutation test-honesty check: mutate assertions, "
                          "re-run tests, report survivors.", cmd_mutate),
         ("decomment", "Check or fix comment slop in files.", cmd_decomment),
@@ -416,6 +546,13 @@ def build_parser():
     dc.add_argument("--threshold", type=float, default=None,
                     help="slop score (0-100) that fails --check (default: "
                          "config comment_slop.threshold, 30)")
+    cc = sub.choices["cheatsniff"]
+    cc.add_argument("paths", nargs="+", help="files or directories to scan")
+    cc.add_argument("--check", action="store_true",
+                    help="report cheat scores (default mode)")
+    cc.add_argument("--threshold", type=float, default=None,
+                    help="cheat score (0-100) that fails --check (default: "
+                         "config cheat_sniff.threshold, 30)")
     mc = sub.choices["mutate-check"]
     mc.add_argument("test_file", help="test file to mutate")
     mc.add_argument("test_cmd", nargs="*",
