@@ -65,6 +65,22 @@ def default_config():
             "deny_extra": [],      # extra user regexes added to the denylist
             "disabled_rules": [],  # rule ids to turn off
         },
+        "comment_slop": {
+            "mode": "block",       # "block" or "warn"
+            "threshold": 30,       # slop score (0-100) that trips the hook
+        },
+        "cheat_sniff": {
+            "mode": "block",       # "block" or "warn"
+            "threshold": 30,       # cheat score (0-100) that trips the hook
+            "allow": [],           # "path-or-basename:kind" suppressions
+        },
+        "bash_write": {
+            "mode": "block",       # "block" or "warn"
+            "protected_paths": [],  # path prefixes; empty = test files
+                                    # (same definition as the test-tampering
+                                    # guard) plus conftest.py
+            "allow": [],           # "path-or-basename:bash-write" suppressions
+        },
     }
 
 
@@ -78,7 +94,8 @@ def load_config():
         return cfg
     if not isinstance(user, dict):
         return cfg
-    for section in ("test_guard", "outbound"):
+    for section in ("test_guard", "outbound", "comment_slop",
+                    "cheat_sniff", "bash_write"):
         u = user.get(section)
         if isinstance(u, dict):
             for k, v in u.items():
