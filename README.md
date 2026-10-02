@@ -1,7 +1,7 @@
 # agent-guard
 
 Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-Five guards plus test-honesty CLIs, one install, zero dependencies (Python
+Six guards plus test-honesty CLIs, one install, zero dependencies (Python
 standard library only):
 
 - **Test-tampering guard** — stops the "green by editing the test" cheat.
@@ -40,6 +40,13 @@ standard library only):
   always-True comparison dunders. A `PreToolUse` hook on `Write`/`Edit`
   blocks cheat patterns in added test text; `agent-guard cheatsniff
   --check` audits the repo.
+- **Cross-tool write guard** (v0.5) — stops Bash from bypassing the
+  Edit/Write hooks. A `PreToolUse` hook on `Bash` statically extracts
+  file-write targets (`>`, `>>`, heredocs, `sed -i`, `tee`, `cp`/`mv`
+  destinations) and applies the same policy the Write-tool guards would:
+  test-ish targets get cheat-sniffed when the content is visible, opaque
+  writes to protected files are blocked. A guardrail on one tool protects
+  nothing if another tool can do the same thing.
 
 The failure modes are real, quoted from the community:
 
@@ -68,6 +75,43 @@ The failure modes are real, quoted from the community:
   adds post-exec read-back as defense-in-depth *on top of* PreToolUse
   prevention: block the bad action before it happens, then verify the claimed
   effect is actually visible afterwards. Prevent first, verify after.
+
+## v0.5: cross-tool write guard
+
+```bash
+agent-guard install   # registers agent-guard hook-bashwrite (PreToolUse on Bash)
+```
+
+The second bypass in the same family. v0.2 closed "write it to a script
+first" (the r/AI_Agents blocklist bypass); v0.5 closes the other one.
+thomastartrau read 28 Claude Code security advisories and found the
+pattern: *"My hooks block certain writes through the Edit and Write
+tools. Once blocked, the agent went through Bash instead: `sed -i`, a
+heredoc, a redirection. I had to add a hook that blocks writes to source
+files via Bash. **A guardrail on one tool protects nothing if another tool
+can do the same thing.**"*
+
+`install` registers `agent-guard hook-bashwrite` as a `PreToolUse` hook on
+`Bash`. It statically extracts file-write targets from the command —
+`>` / `>>` redirections, heredocs (`<<EOF`, `<<-EOF`), `sed -i`
+(including `-i.bak` / `--in-place`), `tee` (with/without `-a`),
+`cp`/`mv`/`install` destinations, chained with `&&` / `;` / `|` — and
+applies the same policy the Write-tool guards would apply:
+
+- **test-ish target** (`test_*.py`, `conftest.py`, `tests/` …): when the
+  written content is visible (heredoc body), it is cheat-sniffed with the
+  v0.4 detectors; an *opaque* write (`sed -i`, bare `>`) to a test file is
+  treated as a violation on its own — that is exactly the bypass shape.
+- **`bash_write.protected_paths`** (path prefixes, default empty = the
+  test-tampering guard's scope): any Bash write under a protected prefix is
+  treated like a Write-tool call — visible content is scored (comment-slop
+  for source-ish files), opaque writes are blocked in block mode.
+
+Warn mode (`AGENT_GUARD_BASHWRITE_MODE=warn` or `bash_write.mode=warn`)
+advises instead of blocking. A `bash_write.allow` list
+(`"tests/legacy/:bash-write"`) covers the judgment calls you disagree
+with. Everything fails open: unparsable commands are allowed, never
+blocked.
 
 ## v0.4: cheat-sniffing beyond test files
 
@@ -268,6 +312,11 @@ allowed rather than breaking your workflow.
     "mode": "block",
     "threshold": 30,
     "allow": []
+  },
+  "bash_write": {
+    "mode": "block",
+    "protected_paths": ["src/", "infra/"],
+    "allow": []
   }
 }
 ```
@@ -285,6 +334,13 @@ allowed rather than breaking your workflow.
   `AGENT_GUARD_CHEAT_THRESHOLD`.
 - `cheat_sniff.allow`: `"path-or-basename:kind"` entries that suppress hits,
   e.g. `"test_sort.py:rng-seed"` or `"*/legacy/*:*"`.
+- `bash_write.mode`: `"block"` (default) or `"warn"`. Env override:
+  `AGENT_GUARD_BASHWRITE_MODE=warn`.
+- `bash_write.protected_paths`: path prefixes where any Bash write is
+  treated like a Write-tool call (default `[]`, which means the
+  test-tampering guard's scope: test files plus `conftest.py`).
+- `bash_write.allow`: `"path-or-basename:bash-write"` entries that suppress
+  the Bash-write guard, e.g. `"tests/fixtures/:bash-write"`.
 - `outbound.allow`: regexes that win over the denylist (e.g. your internal
   registry). Every override is audit-logged.
 - `outbound.deny_extra` / `disabled_rules`: extend or trim the denylist.
@@ -352,9 +408,25 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
   (mock-subject, rng-patch, conftest-patch) have no marker exemption at all.
 - **The cheat hook only watches added test text.** Pre-existing cheats in
   the repo are found by `cheatsniff --check`, not blocked by the hook.
+- **Bash write-target extraction is static and approximate.** It is
+  shlex-based, so heavy quoting, `eval`, command substitution building
+  paths at runtime, and `python3 -c "open(...).write(...)"` are known gaps
+  — the target list is conservative by design (a missed target is a miss,
+  never a crash). Unresolvable `$VAR` expansions, bare globs, and
+  `/dev/null` are skipped, not guessed at. This is the documented
+  frontier for a future version, not a finished parser.
+- **Opaque Bash writes to protected files are blocked, not scored.** When
+  the hook cannot see what is being written (`sed -i`, bare `>`), there is
+  no content to score — block mode blocks the bypass shape itself. If that
+  is too strict for your workflow, use warn mode or write through the Edit
+  tool instead.
 
 ## Roadmap
 
+- ~~**Cross-tool write guard**: stop Bash (`sed -i`, heredocs, redirections)
+  from bypassing the Edit/Write hooks (thomastartrau: "a guardrail on one
+  tool protects nothing if another tool can do the same thing").~~ —
+  shipped in v0.5 as `hook-bashwrite`.
 - ~~**Cheat-sniffing beyond test files**: catch RNG rigging, subject-mocking,
   and conftest plants (the remdore study: half of cheating never touches
   test files).~~ — shipped in v0.4 as `hook-cheatsniff` +
@@ -370,7 +442,8 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
 
 ```bash
 python3 tests/test_agent_guard.py   # 47 smoke tests
-python3 tests/test_cheatsniff.py    # 26 cheat-sniff tests
+python3 tests/test_cheatsniff.py    # 29 cheat-sniff tests
+python3 tests/test_bashwrite.py     # bash write-target extraction + hook tests
 ```
 
 ## License
