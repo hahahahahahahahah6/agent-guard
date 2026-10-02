@@ -112,6 +112,35 @@ One deliberate contrast with a neighbor project: Rashomon (r/aiagents)
 agent's summary. agent-guard *prevents*. Observation tells you after the
 fact; the hook is there before the fact. Different layers, complementary.
 
+## v0.4: cheat-sniffing beyond test files
+
+Half of agent cheating never touches a test file. A dev.to study (remdore,
+2026-10-01, 102 runs × 4 models) found agents patching the RNG *"so the
+list would always be sorted"*, mocking the function under test instead of
+its collaborators, and planting helpers in `conftest.py`. My test-tampering
+guard (tests-only-change diff) and `mutate-check` (assertion mutation) both
+miss this family — "restore the test files and re-run" only catches the
+dumb half.
+
+So v0.4 adds `agent-guard hook-cheatsniff`: a `PreToolUse` hook on
+`Write`/`Edit` that fires only for test-ish files (`test_*.py`,
+`conftest.py`, anything under `tests/`) and scores only the *added* text.
+Six cheat kinds: **mock-subject** (patching the module under test itself),
+**rng-patch** (patching `random.shuffle`/`random.random`),
+**conftest-patch** (`conftest.py` plants) — these three are severe, one hit
+blocks on its own — plus **rng-seed**, **time-freeze**, and
+**weak-comparator** (an `__eq__` that unconditionally returns `True`).
+
+The judgment calls are explicit: a fixed `random.seed(42)` next to a
+"reproducible" comment is legitimate and not flagged; mocking a
+collaborator (`stripe.Charge.create`) is clean. A `cheat_sniff.allow` list
+covers the cases you disagree with. Honest limits, stated plainly: it's
+static text analysis, Python-first, and the subject-vs-collaborator call is
+a filename heuristic (`test_billing.py` → `billing`) — a seatbelt, not a
+vault.
+
+76 tests pass, still zero dependencies.
+
 ## v0.3: the comment-slop guard
 
 The roadmap's last item is now shipped. The failure mode: the agent dumps
