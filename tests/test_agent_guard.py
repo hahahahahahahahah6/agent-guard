@@ -507,10 +507,12 @@ def main():
                         for e in settings["hooks"].get("PreToolUse", [])]
         bak_ok = os.path.exists(sp + ".bak")
         check("install idempotent",
-              n_start == 1 and n_stop == 1 and n_pre == 2 and n_post == 1
+              n_start == 1 and n_stop == 1 and n_pre == 4 and n_post == 1
               and bak_ok
               and any("hook-verify" in c for c in post_cmds)
               and any("hook-commentslop" in c for c in pre_cmds)
+              and any("hook-cheatsniff" in c for c in pre_cmds)
+              and any("hook-bashwrite" in c for c in pre_cmds)
               and "Bash" in pre_matchers and "Write|Edit" in pre_matchers,
               "start=%d stop=%d pre=%d post=%d bak=%s"
               % (n_start, n_stop, n_pre, n_post, bak_ok))
