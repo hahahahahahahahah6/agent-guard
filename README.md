@@ -4,6 +4,10 @@ Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/cl
 Six guards plus test-honesty CLIs, one install, zero dependencies (Python
 standard library only):
 
+```bash
+pip install agent-guard-hooks
+```
+
 - **Test-tampering guard** — stops the "green by editing the test" cheat.
   On `SessionStart` it snapshots hashes of every test and source file; on
   `Stop` it diffs. If test files were modified or deleted while no source
