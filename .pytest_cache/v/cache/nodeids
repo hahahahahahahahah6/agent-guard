@@ -1,4 +1,5 @@
 [
+  "demo/fixtures/shop/tests/test_honest.py::test_total_sums_prices",
   "tests/test_bashwrite.py::test_append",
   "tests/test_bashwrite.py::test_attached_redirect",
   "tests/test_bashwrite.py::test_chained",

@@ -1,5 +1,7 @@
 # agent-guard
 
+[![pipeline status](https://gitlab.com/hahahahahahahahah6/agent-guard/badges/main/pipeline.svg)](https://gitlab.com/hahahahahahahahah6/agent-guard/-/pipelines)
+
 Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 Six guards plus test-honesty CLIs, one install, zero dependencies (Python
 standard library only):
@@ -62,6 +64,16 @@ The failure modes are real, quoted from the community:
 > *"the risk isn't a bad answer, it's a bad action"* — [dank_as_fuck_,](https://www.reddit.com/r/AI_Agents/comments/1wqz6b0/how_are_you_stopping_agents_from_doing_things/)
 > [r/AI_Agents](https://www.reddit.com/r/AI_Agents/comments/1wqz6b0/how_are_you_stopping_agents_from_doing_things/), on why guardrails must live *"below the prompt layer"*
 > (verstands)
+
+## Demo
+
+![agent-guard demo: the test-tampering trap, caught](demo/agent-guard-demo.gif)
+
+60 seconds: an agent weakens `toBe(10)` to `toBe(9)` instead of fixing the
+code — the `Stop` hook blocks it, `cheatsniff` catches RNG-rigging and
+subject-mocking, `decomment` flags comment slop, and honest tests stay
+green. (MP4 version for submissions: `demo/agent-guard-demo.mp4`;
+regenerate both with `vhs demo/demo.tape`.)
 
 ## Semantic reviewer (Nebius x NVIDIA)
 

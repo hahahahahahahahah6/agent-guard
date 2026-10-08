@@ -51,6 +51,8 @@ guard-self-check:
   stage: guard
   image: python:3.12-slim
   needs: [unit-tests, smoke]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git
   script:
     - pip install --quiet .
     - |

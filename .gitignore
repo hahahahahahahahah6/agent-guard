@@ -1,3 +1,5 @@
 dist/
 *.egg-info/
 __pycache__/
+# demo video for Devpost/submissions is local-only (large file); the GIF is the README asset
+demo/agent-guard-demo.mp4
