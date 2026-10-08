@@ -1,3 +1,16 @@
+Metadata-Version: 2.4
+Name: agent-guard-hooks
+Version: 0.5.1
+Summary: Behavior-guardrail hooks for Claude Code: test-tampering + outbound-action guards, mutation test-honesty, and post-exec verification
+Author: hao li
+License: MIT
+Project-URL: Homepage, https://github.com/hahahahahahahahah6/agent-guard
+Keywords: claude-code,hooks,ai-agents,guardrails,developer-tools
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
 # agent-guard
 
 Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
@@ -524,28 +537,14 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
 ## Development
 
 ```bash
-python -m pytest tests/   # 107 tests, all passing
+python3 tests/test_agent_guard.py   # 49 script checks
+python3 tests/test_cheatsniff.py    # 29 script checks
+python3 tests/test_bashwrite.py     # 64 script checks
+python3 -m pytest tests/            # 75 pytest tests
 ```
 
-107 pytest tests, all passing. The shipped package has zero dependencies;
-`pytest` is the only test-runner dependency.
-
-## GitLab CI
-
-`.gitlab-ci.yml` gates every commit through two stages (built for
-[GitLab Transcend: Life After Code](https://gitlab-transcend.devpost.com/)):
-
-- **test** — `pytest` across a Python 3.10–3.13 matrix, plus a smoke job
-  (`py_compile` over `src/` and `--help` on the CLI entry points). JUnit
-  reports are collected as artifacts.
-- **guard** — `guard-self-check`: agent-guard scans its *own* changed files
-  in the commit — `cheatsniff --check` on changed test files,
-  `decomment --check` on changed sources. The repo guarding its own
-  lifecycle: the post-code automation story.
-
-The shipped code stays stdlib-only; the pipeline installs nothing beyond
-`pytest`. A pipeline status badge will be added here once the repo is
-mirrored to GitLab.com.
+142 script checks + 75 pytest tests = 217 total, all passing, still zero
+dependencies.
 
 ## License
 

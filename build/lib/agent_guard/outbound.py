@@ -1,0 +1,612 @@
+"""Outbound-action guard.
+
+A PreToolUse hook on Bash that matches the command string against a denylist
+of risky action patterns: pushes to protected branches, package publishes,
+prod deploys, cloud provisioning (spend), and mass-send channels. Matches
+block (exit 2); a user allowlist in config.json overrides the denylist.
+
+Everything fails open: any unexpected error means "allow".
+"""
+
+import os
+import re
+import shlex
+import stat
+import subprocess
+
+# (rule_id, human description, [regexes])
+# NOTE: git push is NOT regexed here; it is parsed by _check_git_push below,
+# which understands `git -C <dir> push`, bare pushes, and HEAD refspecs.
+RULES = [
+    ("package-publish",
+     "Publish a package (npm/twine/cargo/gh release)",
+     [r"\bnpm\s+publish\b(?![^|;&]*--dry-run)",
+      r"\btwine\s+upload\b",
+      r"\bcargo\s+publish\b",
+      r"\bgh\s+release\s+create\b"]),
+    ("prod-deploy",
+     "Production deploy",
+     [r"\bkubectl\s+(apply|delete|replace)\b",
+      r"\bkubectl\s+rollout\s+restart\b",
+      r"\bterraform\s+apply\b",
+      r"\bfly\s+deploy\b",
+      r"\bvercel\b[^|;&]*--prod\b",
+      r"\bserverless\s+deploy\b",
+      r"\bsls\s+deploy\b"]),
+    ("cloud-provision",
+     "Cloud resource provisioning (spend)",
+     [r"\baws\s+ec2\s+run-instances\b",
+      r"\bgcloud\s+compute\s+instances\s+create\b",
+      r"\baz\s+vm\s+create\b",
+      r"\bdoctl\s+compute\s+droplet\s+create\b",
+      r"\bfly\s+launch\b",
+      r"\bfly\s+machine\s+run\b"]),
+    ("mass-send",
+     "Mass-send channel (Slack webhook / mailer / email API)",
+     [r"https?://hooks\.slack\.com/services/",
+      r"\bsendmail\b",
+      r"\bmsmtp\b",
+      r"api\.sendgrid\.com",
+      r"api\.mailgun\.net"]),
+]
+
+_COMPILED = [(rid, desc, [re.compile(p, re.IGNORECASE) for p in pats])
+             for rid, desc, pats in RULES]
+
+
+# ---------------------------------------------------------------------------
+# git push: parsed, not regexed
+# ---------------------------------------------------------------------------
+
+def _looks_protected_ref(name):
+    n = name.lower()
+    if n in ("main", "master", "prod", "production"):
+        return True
+    return n.startswith("release/")
+
+
+def _is_protected_ref(name):
+    """True if a ref name (branch or refs/heads/<branch>) is protected."""
+    n = (name or "").strip()
+    if n.lower().startswith("refs/heads/"):
+        n = n[len("refs/heads/"):]
+    return _looks_protected_ref(n) or _looks_protected_ref(n.split("/")[-1])
+
+
+_GIT_GLOBAL_OPTS_WITH_VAL = {
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--super-prefix", "--config-env",
+}
+_PUSH_OPTS_WITH_VAL = {"--repo", "--receive-pack", "--exec"}
+_FORCE_FLAGS = ("--force", "-f", "--force-with-lease")
+
+# Sentinel: push destination is the current branch (resolve via git).
+_CURRENT_BRANCH = object()
+
+
+def _current_branch(cwd):
+    """Current branch name via `git symbolic-ref --short HEAD`.
+
+    Returns None when it cannot be determined (detached HEAD, not a git
+    repo, git missing or erroring). Callers treat None as "fail open".
+    Never raises.
+    """
+    try:
+        p = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=10)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    name = (p.stdout or "").strip()
+    return name or None
+
+
+def _resolve_cwd(git_dir, hook_cwd):
+    """Effective repo dir: the hook's cwd, overridden by `git -C <dir>`."""
+    try:
+        base = hook_cwd or os.getcwd()
+        if not git_dir:
+            return base
+        if os.path.isabs(git_dir):
+            return os.path.normpath(git_dir)
+        return os.path.normpath(os.path.join(base, git_dir))
+    except Exception:
+        return hook_cwd or os.getcwd()
+
+
+def _looks_like_refspec(arg):
+    """A lone positional that is clearly a refspec, not a repository."""
+    return ":" in arg or arg.startswith("+")
+
+
+def _dst_of_refspec(rs):
+    """Split a push refspec into (destination, is_force).
+
+    Destination is a branch name, the literal "HEAD" (resolved by the
+    caller against the current branch), or None when it cannot be
+    determined. Never raises.
+    """
+    try:
+        s = (rs or "").strip()
+        force = False
+        if s.startswith("+"):
+            force = True
+            s = s[1:]
+        # Ref names cannot contain ':', so split on the first one.
+        # `src` -> dst defaults to src; `src:dst` -> dst; `:dst` -> dst
+        # (remote-branch deletion).
+        if ":" in s:
+            src, dst = s.split(":", 1)
+        else:
+            src, dst = s, s
+        dst = dst.strip()
+        if not dst:
+            dst = src.strip()
+        if not dst:
+            return None, force
+        return dst, force
+    except Exception:
+        return None, False
+
+
+def _check_git_push(command, cwd=None):
+    """Block `git push` only when its DESTINATION is a protected branch.
+
+    The destination is resolved from the push arguments:
+      * `git push` / `git push <repo>` (no refspec): the current branch,
+        via `git symbolic-ref --short HEAD` in the hook's cwd
+        (`git -C <dir>` overrides the cwd).
+      * `git push <repo> <refspec>...`: the destination side of each
+        refspec (`feature-x:main` -> main); HEAD resolves to the current
+        branch; `:main` (remote-branch deletion) counts as main.
+      * `--force` / `--force-with-lease` (or a `+` refspec) targeting a
+        protected branch stays blocked; force to other branches is allowed.
+      * `--all` / `--mirror` push every ref, so they are blocked;
+        `--tags` alone pushes no branches and is allowed.
+    When the destination cannot be determined (detached HEAD, not a git
+    repo, git errors), the push is allowed — fail open, never break the
+    user on ambiguity.
+    Returns (rule_id, detail) or (None, None) when no push is risky.
+    Never raises.
+    """
+    try:
+        return _check_git_push_inner(command, cwd)
+    except Exception:
+        return None, None  # fail open
+
+
+def _check_git_push_inner(command, cwd):
+    for chunk in re.split(r"[|;&]", command):
+        try:
+            toks = shlex.split(chunk, posix=True)
+        except ValueError:
+            toks = chunk.split()
+
+        gi = next((i for i, t in enumerate(toks)
+                   if t == "git" or t.endswith("/git")), None)
+        if gi is None:
+            continue
+
+        # Skip git global options between `git` and the subcommand,
+        # remembering -C <dir> (it changes which repo the push targets).
+        git_dir = None
+        j = gi + 1
+        while j < len(toks):
+            t = toks[j]
+            if t == "-C":
+                if j + 1 < len(toks):
+                    git_dir = toks[j + 1]
+                j += 2
+                continue
+            if t.startswith("-C") and len(t) > 2:
+                git_dir = t[2:]  # attached -C<dir> form
+                j += 1
+                continue
+            base = t.split("=", 1)[0]
+            if t in _GIT_GLOBAL_OPTS_WITH_VAL:
+                j += 2
+            elif base in _GIT_GLOBAL_OPTS_WITH_VAL:
+                j += 1  # attached --opt=value form
+            elif t.startswith("-") and t != "-":
+                j += 1  # boolean global flag
+            else:
+                break
+        if j >= len(toks) or toks[j] != "push":
+            continue
+
+        # Parse push args: skip options, collect positionals.
+        args, force = [], False
+        push_all = push_tags = False
+        k = j + 1
+        while k < len(toks):
+            t = toks[k]
+            if t == "--":
+                args.extend(toks[k + 1:])
+                break
+            if t.startswith("-") and t != "-":
+                base = t.split("=", 1)[0]
+                if base in _FORCE_FLAGS:
+                    force = True
+                elif base in ("--all", "--mirror"):
+                    push_all = True
+                elif base == "--tags":
+                    push_tags = True
+                if base in _PUSH_OPTS_WITH_VAL and "=" not in t:
+                    k += 2
+                else:
+                    k += 1
+                continue
+            args.append(t)
+            k += 1
+
+        if push_all:
+            return ("git-push-protected",
+                    "`git push --all`/`--mirror` pushes every ref, "
+                    "including protected branches")
+
+        # Split positionals into refspecs. `git push [<repo> [<refspec>..]]`:
+        # a lone positional is the repository (destination = current
+        # branch), unless it is clearly a refspec (`:main`, `+main`).
+        if not args:
+            refspecs = []
+        elif len(args) == 1 and _looks_like_refspec(args[0]):
+            refspecs = args
+        else:
+            refspecs = args[1:]
+
+        if push_tags and not refspecs:
+            continue  # tags only: no branch destination
+
+        eff_cwd = _resolve_cwd(git_dir, cwd)
+        _cache = {}
+
+        def current_branch():
+            if "branch" not in _cache:
+                _cache["branch"] = _current_branch(eff_cwd)
+            return _cache["branch"]
+
+        # (destination-spec, is_force); _CURRENT_BRANCH resolves via git.
+        pairs = []
+        if not refspecs:
+            pairs.append((_CURRENT_BRANCH, force))
+        else:
+            for rs in refspecs:
+                dst, rs_force = _dst_of_refspec(rs)
+                pairs.append((dst, force or rs_force))
+
+        for spec, f in pairs:
+            if spec is _CURRENT_BRANCH:
+                dst = current_branch()
+            elif isinstance(spec, str) and spec.upper() == "HEAD":
+                dst = current_branch()
+            else:
+                dst = spec
+            if not dst:
+                continue  # destination unknown -> fail open
+            if _is_protected_ref(dst):
+                if f:
+                    return ("git-push-force",
+                            "force push to protected ref '%s'" % dst)
+                return ("git-push-protected",
+                        "push to protected ref '%s'" % dst)
+    return None, None
+
+
+def check(command, config=None, cwd=None):
+    """Decide whether a Bash command may run.
+
+    Returns (allowed: bool, reason: str, rule_id or None).
+    allowed-by-allowlist returns (True, "", "allowlist:<pattern>").
+    `cwd` is the hook's working directory, used to resolve the current
+    branch for destination-aware `git push` checks and to resolve
+    relative script paths for script-content inspection.
+    Never raises.
+    """
+    try:
+        return _check_inner(command or "", config or {}, cwd)
+    except Exception:
+        return True, "", None  # fail open
+
+
+# ---------------------------------------------------------------------------
+# script-content inspection
+# ---------------------------------------------------------------------------
+# Adversarial case this closes: the Bash denylist is bypassed as soon as the
+# agent writes the destructive command into a script file and executes the
+# script instead (`bash evil.sh`). When a command runs a script, the script's
+# FILE CONTENT is scanned with the same rule logic; hits get a
+# "script-content:<rule_id>" id so the audit log shows where the hit came
+# from. One level only (a script executing another script is not followed).
+
+_SCRIPT_EXTS = {".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs",
+                ".ts", ".rb", ".pl", ".php"}
+_MAX_SCRIPT_BYTES = 1024 * 1024  # skip files >1MB: fail open
+
+_INTERPRETERS = {"bash", "sh", "zsh", "dash", "python", "python2",
+                 "python3", "node", "nodejs", "ruby", "perl", "php"}
+# Interpreter options whose next token is inline code, not a file.
+_INLINE_CODE_OPTS = {"-c", "-e", "-p"}
+# Interpreter options whose next token is a module name, not a file.
+_MODULE_OPTS = {"-m"}
+# Wrappers that may precede the real command (env FOO=1 ./run.sh).
+_EXEC_PREFIXES = {"env", "sudo", "nohup", "time", "nice"}
+
+
+def _is_script_path(tok):
+    """A token in execution position that looks like a script file."""
+    try:
+        if not (tok.startswith("./") or tok.startswith("/") or "/" in tok):
+            return False
+        _, ext = os.path.splitext(tok)
+        return ext.lower() in _SCRIPT_EXTS
+    except Exception:
+        return False
+
+
+def _extract_script_refs(command):
+    """Find scripts a command executes.
+
+    Returns a list of ("file", path) or ("code", inline_code) refs.
+    Recognizes `bash|sh|zsh|dash|python|node|ruby|perl|php <file>`,
+    `./<file>` and `/path/<file>` with a script extension,
+    `source <file>`, and `. <file>`. Never raises.
+    """
+    refs = []
+    try:
+        chunks = re.split(r"[|;&]", command or "")
+    except Exception:
+        return refs
+    for chunk in chunks:
+        try:
+            toks = shlex.split(chunk, posix=True)
+        except ValueError:
+            try:
+                toks = chunk.split()
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if not toks:
+            continue
+        # Strip wrappers: env FOO=1 ./run.sh
+        while len(toks) > 1 and toks[0] in _EXEC_PREFIXES:
+            toks = toks[1:]
+        head = os.path.basename(toks[0])
+        if head in _INTERPRETERS:
+            i = 1
+            while i < len(toks):
+                t = toks[i]
+                if t in _INLINE_CODE_OPTS and i + 1 < len(toks):
+                    refs.append(("code", toks[i + 1]))
+                    break  # rest are $0 / args, not a script file
+                if t in _MODULE_OPTS:
+                    i += 2
+                    continue
+                if t.startswith("-") and t != "-":
+                    i += 1
+                    continue
+                refs.append(("file", t))
+                break  # first positional is the script
+        elif toks[0] in ("source", "."):
+            if len(toks) > 1 and not toks[1].startswith("-"):
+                refs.append(("file", toks[1]))
+        elif _is_script_path(toks[0]):
+            refs.append(("file", toks[0]))
+    return refs
+
+
+def _resolve_script(path_str, cwd):
+    """Absolute path of a readable, regular, <=1MB script file.
+
+    Returns None for missing/unreadable/oversized files (fail open).
+    Never raises.
+    """
+    try:
+        p = path_str
+        if not os.path.isabs(p):
+            p = os.path.join(cwd or os.getcwd(), p)
+        p = os.path.normpath(p)
+        st = os.stat(p)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_size == 0 or st.st_size > _MAX_SCRIPT_BYTES:
+            return None
+        _, ext = os.path.splitext(p)
+        if ext.lower() not in _SCRIPT_EXTS:
+            return None
+        return p
+    except Exception:
+        return None
+
+
+def _read_script(path):
+    """Script file content as text, or None when unreadable. Never raises."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _script_base_disabled(prefixed_rid, disabled):
+    """Disabling a base rule also disables its script-content variant."""
+    if prefixed_rid in disabled:
+        return True
+    if prefixed_rid.startswith("script-content:"):
+        return prefixed_rid[len("script-content:"):] in disabled
+    return False
+
+
+def _script_rule_desc(base_rid):
+    if base_rid == "git-push-protected":
+        return "Push to a protected branch (main/master/prod*/release/*)"
+    if base_rid == "git-push-force":
+        return ("Force push to a protected branch "
+                "(rewrites remote history)")
+    if base_rid.startswith("deny_extra:"):
+        return "user rule"
+    for rid, desc, _ in RULES:
+        if rid == base_rid:
+            return desc
+    return base_rid
+
+
+def _scan_text_rules(text, out, cwd):
+    """Scan arbitrary text with the same rule logic as the command string.
+
+    Returns (prefixed_rule_id, desc, detail) or (None, None, None).
+    Never raises.
+    """
+    try:
+        return _scan_text_rules_inner(text, out, cwd)
+    except Exception:
+        return None, None, None
+
+
+def _scan_text_rules_inner(text, out, cwd):
+    for pat in out.get("allow", []) or []:
+        try:
+            if re.search(pat, text, re.IGNORECASE):
+                return None, None, None
+        except re.error:
+            continue
+
+    rid, detail = _check_git_push(text, cwd)
+    if rid is not None:
+        return "script-content:" + rid, _script_rule_desc(rid), detail
+
+    for rid, _desc, rxs in _COMPILED:
+        try:
+            if any(rx.search(text) for rx in rxs):
+                return ("script-content:" + rid,
+                        _script_rule_desc(rid), None)
+        except Exception:
+            continue
+
+    for pat in out.get("deny_extra", []) or []:
+        try:
+            if re.search(pat, text, re.IGNORECASE):
+                base = "deny_extra:" + pat
+                return ("script-content:" + base,
+                        _script_rule_desc(base), None)
+        except re.error:
+            continue
+
+    return None, None, None
+
+
+def _check_script_content(command, out, cwd, disabled):
+    """Block when a script executed by the command contains a risky action.
+
+    Returns (allowed, reason, rule_id); allowed True when nothing found.
+    Never raises.
+    """
+    try:
+        return _check_script_content_inner(command, out, cwd, disabled)
+    except Exception:
+        return True, "", None  # fail open
+
+
+def _check_script_content_inner(command, out, cwd, disabled):
+    seen = set()
+    for kind, ref in _extract_script_refs(command):
+        if kind == "code":
+            text, origin = ref, "inline code"
+        else:
+            if not _is_script_path(ref) and os.path.splitext(ref)[1].lower() \
+                    not in _SCRIPT_EXTS:
+                # Interpreter arg without a script extension (e.g. -m mod,
+                # or a bare name): not a script file, skip.
+                continue
+            path = _resolve_script(ref, cwd)
+            if path is None or path in seen:
+                continue
+            seen.add(path)
+            text = _read_script(path)
+            if not text:
+                continue
+            origin = "script file '%s'" % path
+        rid, desc, detail = _scan_text_rules(text, out, cwd)
+        if rid is None or _script_base_disabled(rid, disabled):
+            continue
+        if detail:
+            what = "%s: %s" % (desc, detail)
+        else:
+            what = desc
+        reason = (
+            "Outbound-action guard blocked this command (rule '%s': %s; "
+            "matched inside %s executed by this command).\n"
+            "If this action is intended, add an allowlist regex to "
+            "outbound.allow in %s, or run it yourself outside the agent."
+            % (rid, what, origin, _config_hint()))
+        return False, reason, rid
+    return True, "", None
+
+
+def _check_inner(command, config, cwd):
+    out = config.get("outbound", {}) if isinstance(config, dict) else {}
+
+    for pat in out.get("allow", []) or []:
+        try:
+            if re.search(pat, command, re.IGNORECASE):
+                return True, "", "allowlist:" + pat
+        except re.error:
+            continue
+
+    disabled = set(out.get("disabled_rules", []) or [])
+
+    rid, detail = _check_git_push(command, cwd)
+    if rid is not None and rid not in disabled:
+        desc = {"git-push-protected":
+                "Push to a protected branch (main/master/prod*/release/*)",
+                "git-push-force":
+                "Force push to a protected branch "
+                "(rewrites remote history)"}[rid]
+        reason = (
+            "Outbound-action guard blocked this command (rule '%s': %s: %s).\n"
+            "If this action is intended, add an allowlist regex to "
+            "outbound.allow in %s, or run it yourself outside the agent."
+            % (rid, desc, detail, _config_hint()))
+        return False, reason, rid
+
+    for rid, desc, rxs in _COMPILED:
+        if rid in disabled:
+            continue
+        if any(rx.search(command) for rx in rxs):
+            reason = (
+                "Outbound-action guard blocked this command (rule '%s': %s).\n"
+                "If this action is intended, add an allowlist regex to "
+                "outbound.allow in %s, or run it yourself outside the agent."
+                % (rid, desc, _config_hint()))
+            return False, reason, rid
+
+    # Script-content inspection: a denylisted action smuggled into a script
+    # file (`bash evil.sh`) is blocked with a script-content:<rule> id.
+    allowed, reason, rid = _check_script_content(command, out, cwd, disabled)
+    if not allowed:
+        return False, reason, rid
+
+    for pat in out.get("deny_extra", []) or []:
+        try:
+            if re.search(pat, command, re.IGNORECASE):
+                return (False,
+                        "Outbound-action guard blocked this command "
+                        "(user rule '%s')." % pat,
+                        "deny_extra:" + pat)
+        except re.error:
+            continue
+
+    return True, "", None
+
+
+def _config_hint():
+    from . import state
+    return state.config_path()
+
+
+def rule_ids():
+    return (["git-push-protected", "git-push-force"]
+            + [rid for rid, _, _ in RULES])

@@ -1,0 +1,88 @@
+# GitLab CI — agent-guard
+# GitLab Transcend "Life After Code": this pipeline IS the entry's post-code
+# automation story. Every commit is test-gated across supported Pythons, then
+# agent-guard scans the commit's own changed files for test cheating and
+# comment slop — the repo guarding its own lifecycle: testing/security/
+# compliance stages of DevSecOps, automated by the agent-guard hooks
+# themselves.
+#
+# Notes:
+# - stdlib only: the only extra package ever installed is pytest (test
+#   runner); the shipped code itself has zero dependencies.
+# - tests/test_cheatsniff.py is intentionally excluded from cheatsniff: it is
+#   a fixture file containing cheat patterns as examples for the scanner.
+
+stages: [test, guard]
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip/
+
+unit-tests:
+  stage: test
+  parallel:
+    matrix:
+      - PY: ["3.10", "3.11", "3.12", "3.13"]
+  image: python:${PY}-slim
+  script:
+    - pip install --quiet pytest .
+    - python -m pytest tests/ -q --junitxml=report-${PY}.xml
+  artifacts:
+    when: always
+    reports:
+      junit: report-*.xml
+
+smoke:
+  stage: test
+  image: python:3.12-slim
+  script:
+    # stdlib-only lint: everything under src/ must at least compile.
+    - python -m py_compile $(find src -name '*.py')
+    - pip install --quiet .
+    # CLI entry points must come up and answer --help.
+    - agent-guard --help
+    - agent-guard cheatsniff --help
+    - agent-guard decomment --help
+
+guard-self-check:
+  stage: guard
+  image: python:3.12-slim
+  needs: [unit-tests, smoke]
+  script:
+    - pip install --quiet .
+    - |
+      # Files changed in this commit (MR diff when available).
+      if [ -n "$CI_MERGE_REQUEST_DIFF_BASE_SHA" ]; then
+        BASE="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+      elif git rev-parse --verify --quiet HEAD~1 >/dev/null; then
+        BASE="HEAD~1"
+      else
+        BASE=""
+      fi
+      if [ -n "$BASE" ]; then
+        CHANGED=$(git diff --name-only "$BASE"...HEAD -- '*.py')
+      else
+        CHANGED=$(git ls-files '*.py')
+      fi
+      TEST_FILES=$(printf '%s\n' "$CHANGED" \
+        | grep -E '(^|/)tests?/.*\.py$' \
+        | grep -v -E '(^|/)tests?/test_cheatsniff\.py$' || true)
+      SRC_FILES=$(printf '%s\n' "$CHANGED" \
+        | grep -v -E '(^|/)tests?/.*\.py$' || true)
+      if [ -n "$TEST_FILES" ]; then
+        echo "--- cheatsniff on changed tests ---"
+        # shellcheck disable=SC2086
+        agent-guard cheatsniff --check $TEST_FILES
+      else
+        echo "no changed test files to scan"
+      fi
+      if [ -n "$SRC_FILES" ]; then
+        echo "--- decomment check on changed sources ---"
+        # shellcheck disable=SC2086
+        agent-guard decomment --check $SRC_FILES
+      else
+        echo "no changed source files to scan"
+      fi
