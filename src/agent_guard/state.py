@@ -12,6 +12,90 @@ import time
 MAX_HASH_BYTES = 50 * 1024 * 1024
 MAX_AUDIT_LINES = 20000
 PRUNE_KEEP = 10000
+PING_KEEP_DAYS = 60
+
+
+def pings_path():
+    return os.path.join(state_dir(), "hook-pings.json")
+
+
+def _today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def record_ping(guard):
+    """Count one hook invocation for the gate-liveness verifier.
+
+    Tiny per-day counters (not the audit log) so `agent-guard verify`
+    can tell "mounted but never ran" apart from "ran". Never raises.
+    """
+    try:
+        p = pings_path()
+        data = {"days": {}}
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+            if isinstance(obj, dict) and isinstance(
+                    obj.get("days"), dict):
+                data = obj
+        except Exception:
+            pass
+        days = data["days"]
+        today = _today()
+        bucket = days.get(today)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            days[today] = bucket
+        bucket[str(guard)] = int(bucket.get(str(guard), 0) or 0) + 1
+        cutoff = _today()
+        # prune buckets older than PING_KEEP_DAYS (lexicographic dates)
+        try:
+            oldest = time.strftime(
+                "%Y-%m-%d", time.localtime(
+                    time.time() - PING_KEEP_DAYS * 86400))
+            for k in [k for k in days if k < oldest]:
+                del days[k]
+        except Exception:
+            pass
+        os.makedirs(state_dir(), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def read_pings(days=7):
+    """{guard: count} for the last `days` days. Never raises."""
+    out = {}
+    try:
+        days = max(1, int(days))
+    except Exception:
+        days = 7
+    try:
+        with open(pings_path(), "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        buckets = obj.get("days") if isinstance(obj, dict) else None
+        if not isinstance(buckets, dict):
+            return out
+        try:
+            oldest = time.strftime(
+                "%Y-%m-%d", time.localtime(
+                    time.time() - days * 86400))
+        except Exception:
+            return out
+        for day, bucket in buckets.items():
+            if not isinstance(bucket, dict) or day < oldest:
+                continue
+            for guard, n in bucket.items():
+                try:
+                    out[str(guard)] = out.get(str(guard), 0) + int(n)
+                except Exception:
+                    continue
+        return out
+    except Exception:
+        return out
 
 
 def state_dir():
@@ -74,6 +158,10 @@ def default_config():
             "threshold": 30,       # cheat score (0-100) that trips the hook
             "allow": [],           # "path-or-basename:kind" suppressions
         },
+        "tamper": {
+            "mode": "block",       # "block" or "warn"
+            "threshold": 30,       # tamper score (0-100) that trips the hook
+        },
         "bash_write": {
             "mode": "block",       # "block" or "warn"
             "protected_paths": [],  # path prefixes; empty = test files
@@ -108,7 +196,7 @@ def load_config():
     if not isinstance(user, dict):
         return cfg
     for section in ("test_guard", "outbound", "comment_slop",
-                    "cheat_sniff", "bash_write", "semreview"):
+                    "cheat_sniff", "bash_write", "semreview", "tamper"):
         u = user.get(section)
         if isinstance(u, dict):
             for k, v in u.items():
