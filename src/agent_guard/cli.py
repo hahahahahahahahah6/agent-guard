@@ -2,12 +2,14 @@
 
 import argparse
 import copy
+import io
 import json
 import os
 import shutil
 import sys
 
-from . import bashwrite, cheatsniff, commentslop, mutate, outbound, semreview, state, testguard, verify
+from . import bashwrite, cheatsniff, commentslop, gatecheck, mutate, \
+    outbound, semreview, state, tamper, testguard, verify, xtool
 
 
 def _hook_input():
@@ -31,6 +33,7 @@ def _project_root(data):
 def cmd_snapshot(args):
     """SessionStart: record test+source digests. Never blocks."""
     try:
+        state.record_ping("snapshot")
         data = _hook_input()
         session = str(data.get("session_id", "") or "")
         testguard.snapshot(_project_root(data), session_id=session or None)
@@ -39,14 +42,35 @@ def cmd_snapshot(args):
     return 0
 
 
+def _tamper_enrichment(root, session_id):
+    """Scan blocked-session test files for tamper shapes. Never raises."""
+    try:
+        lines = []
+        for rel in testguard.changed_test_files(root, session_id)[:10]:
+            full = os.path.join(root, rel)
+            score, hits = tamper.scan_file(full)
+            for ln, end_ln, kind, excerpt in hits[:5]:
+                loc = "L%d" % ln if ln == end_ln else "L%d-%d" % (ln, end_ln)
+                lines.append("  - %s %s [%s] %s" % (rel, loc, kind, excerpt))
+        if not lines:
+            return ""
+        return ("Tamper shapes spotted in the changed tests:\n" +
+                "\n".join(lines) + "\n")
+    except Exception:
+        return ""
+
+
 def cmd_test(args):
     """Stop: diff test files vs snapshot; block tests-only changes.
 
     Honors `stop_hook_active`: when Claude Code tells us a Stop hook already
     fired, we must not block again or the session can never end (infinite
     loop). The first block already delivered the warning to the agent.
+    AGENT_GUARD_FORCE_WARN=1 (set by the cross-tool shim for events that
+    cannot block, e.g. Gemini CLI SessionEnd) downgrades to a warning.
     """
     try:
+        state.record_ping("test")
         data = _hook_input()
         if data.get("stop_hook_active"):
             return 0
@@ -55,12 +79,18 @@ def cmd_test(args):
         sid = None if session == "unknown" else session
         allowed, reason = testguard.check(root, session_id=sid)
         if not allowed:
+            extra = _tamper_enrichment(root, sid)
+            if extra:
+                reason = reason.rstrip("\n") + "\n" + extra
+            forced_warn = os.environ.get("AGENT_GUARD_FORCE_WARN", "") == "1"
+            warn_mode = testguard.mode() == "warn" or forced_warn
             state.append_audit({
                 "guard": "test", "tool": "Stop", "session": session,
-                "decision": "blocked", "rule": "tests-only-change",
+                "decision": "warn" if warn_mode else "blocked",
+                "rule": "tests-only-change",
                 "reason": reason.split("\n")[0],
             })
-            if testguard.mode() == "warn":
+            if warn_mode:
                 sys.stderr.write("WARNING (not blocking): " + reason + "\n")
                 return 0
             sys.stderr.write(reason + "\n")
@@ -73,6 +103,7 @@ def cmd_test(args):
 def cmd_outbound(args):
     """PreToolUse on Bash: denylist risky outbound actions."""
     try:
+        state.record_ping("outbound")
         data = _hook_input()
         tool = data.get("tool_name", "")
         if tool != "Bash":
@@ -106,6 +137,7 @@ def cmd_verify(args):
     Advisory only: always exits 0, never blocks.
     """
     try:
+        state.record_ping("verify")
         return verify.run_hook()
     except Exception:
         return 0  # fail open, always
@@ -218,6 +250,7 @@ def cmd_commentslop(args):
     warns (exit 0) in warn mode. Fails open on everything unexpected.
     """
     try:
+        state.record_ping("commentslop")
         data = _hook_input()
         tool = data.get("tool_name", "")
         if tool not in ("Write", "Edit"):
@@ -336,6 +369,7 @@ def cmd_hook_cheatsniff(args):
     block mode, warns (exit 0) in warn mode. Fails open on everything.
     """
     try:
+        state.record_ping("cheatsniff")
         data = _hook_input()
         tool = data.get("tool_name", "")
         if tool not in ("Write", "Edit"):
@@ -402,6 +436,7 @@ def cmd_hook_bashwrite(args):
     in warn mode. Fails open on everything.
     """
     try:
+        state.record_ping("bashwrite")
         data = _hook_input()
         if data.get("tool_name", "") != "Bash":
             return 0
@@ -447,6 +482,7 @@ def cmd_semreview(args):
     semreview.mode=block or AGENT_GUARD_SEMREVIEW_MODE=block).
     """
     try:
+        state.record_ping("semreview")
         if bool(args.diff) == bool(args.command):
             sys.stderr.write(
                 "semreview: pass exactly one of --diff <file> or "
@@ -480,6 +516,164 @@ def cmd_semreview(args):
     except Exception as e:
         sys.stderr.write("semreview: internal error (%s); failing open.\n"
                          % e)
+        return 0
+
+
+def cmd_hook_tamper(args):
+    """PreToolUse on Write/Edit: block tamper shapes in added test text.
+
+    Only fires for test-ish files. Scores the ADDED text only for
+    weakened assertions (toBe -> toBeTruthy), newly skipped/focused
+    tests (.skip/.only), and snapshot updates. Blocks (exit 2) in block
+    mode, warns (exit 0) in warn mode. Fails open on everything.
+    """
+    try:
+        state.record_ping("tamper")
+        data = _hook_input()
+        tool = data.get("tool_name", "")
+        if tool not in ("Write", "Edit"):
+            return 0
+        tool_input = data.get("tool_input")
+        if not isinstance(tool_input, dict):
+            return 0
+        session = str(data.get("session_id", "") or "unknown")
+        path = tool_input.get("file_path") or ""
+        if not _testy_path(path) and not tamper.is_snapshot_path(path):
+            return 0
+        added = _added_text(tool, tool_input)
+        if not added.strip() and not tamper.is_snapshot_path(path):
+            return 0
+        cfg = state.load_config()
+        score, hits = tamper.score_text(added, path)
+        threshold = tamper.threshold(cfg)
+        if score < threshold:
+            return 0
+        lines = []
+        for ln, end_ln, kind, excerpt in hits[:8]:
+            loc = "L%d" % ln if ln == end_ln else "L%d-%d" % (ln, end_ln)
+            lines.append("  %s [%s] %s" % (loc, kind, excerpt))
+        reason = (
+            "Tamper guard: the %s is adding test changes that match known "
+            "test-tampering shapes (score %.1f >= %.1f).\n%s\n"
+            "Weakened assertions, skipped/focused tests, and unreviewed "
+            "snapshot updates make the suite green without proving the "
+            "fix. Keep the strong assertion, unskip the test, or review "
+            "the snapshot diff before updating.\n"
+            "Bypass (not recommended): AGENT_GUARD_TAMPER_MODE=warn, or "
+            "tamper.mode=warn in %s."
+            % (tool, score, threshold, "\n".join(lines),
+               state.config_path()))
+        forced_warn = os.environ.get("AGENT_GUARD_FORCE_WARN", "") == "1"
+        warn_mode = tamper.mode(cfg) == "warn" or forced_warn
+        state.append_audit({
+            "guard": "tamper", "tool": tool, "session": session,
+            "file": str(path)[:200],
+            "decision": "warn" if warn_mode else "blocked",
+            "score": score,
+            "reason": reason.split("\n")[0],
+        })
+        if warn_mode:
+            sys.stderr.write("WARNING (not blocking): " + reason + "\n")
+            return 0
+        sys.stderr.write(reason + "\n")
+        return 2
+    except Exception:
+        return 0  # fail open, always
+
+
+def _tamper_check(paths, threshold):
+    """Print per-file tamper scores; exit 1 if any hits the threshold."""
+    try:
+        bad = 0
+        for root in paths:
+            for path, score, hits in tamper.scan_path(root):
+                flag = "TAMPER?" if score >= threshold else "ok"
+                print("%s: score %.1f (%d hits) [%s]" % (path, score,
+                                                        len(hits), flag))
+                for ln, end_ln, kind, excerpt in hits[:10]:
+                    loc = "L%d" % ln if ln == end_ln else "L%d-%d" % (ln, end_ln)
+                    print("  %s [%s] %s" % (loc, kind, excerpt))
+                if score >= threshold:
+                    bad += 1
+        if bad:
+            print("%d file(s) at or above the tamper threshold (%.1f)."
+                  % (bad, threshold))
+            return 1
+        return 0
+    except Exception as e:
+        sys.stderr.write("tamper-check: internal error (%s); failing open.\n"
+                         % e)
+        return 0
+
+
+def cmd_tampercheck(args):
+    """Scan test files for tamper shapes: weakened assertions, skips,
+    snapshot updates."""
+    try:
+        cfg = state.load_config()
+        threshold = args.threshold
+        if threshold is None:
+            threshold = tamper.threshold(cfg)
+        return _tamper_check(args.paths, threshold)
+    except Exception as e:
+        sys.stderr.write("tamper-check: internal error (%s); failing open.\n"
+                         % e)
+        return 0
+
+
+SHIM_COMMANDS = {
+    "hook-snapshot": "cmd_snapshot",
+    "hook-test": "cmd_test",
+    "hook-outbound": "cmd_outbound",
+    "hook-verify": "cmd_verify",
+    "hook-commentslop": "cmd_commentslop",
+    "hook-cheatsniff": "cmd_hook_cheatsniff",
+    "hook-bashwrite": "cmd_hook_bashwrite",
+    "hook-tamper": "cmd_hook_tamper",
+}
+
+
+def cmd_shim(args):
+    """Cross-tool shim: normalize a Codex/Gemini hook payload, then run a
+    hook command unchanged.
+
+    Usage: agent-guard shim --tool codex|gemini [--warn] <hook-command>
+    --warn downgrades blocks to warnings (for events the tool cannot
+    block, e.g. Gemini CLI SessionEnd).
+    """
+    try:
+        data = _hook_input()
+        norm = xtool.normalize(args.tool, data)
+        if norm is None:
+            return 0  # unmapped payload: nothing to guard, fail open
+        if args.warn:
+            os.environ["AGENT_GUARD_FORCE_WARN"] = "1"
+        func = globals().get(SHIM_COMMANDS.get(args.hook_cmd, ""))
+        if not callable(func):
+            return 0
+        sys.stdin = io.StringIO(json.dumps(norm))
+        return func(args)
+    except Exception:
+        return 0  # fail open, always
+
+
+def cmd_gatecheck(args):
+    """Gate-liveness check: are the hooks mounted, and did they run?
+
+    `agent-guard verify [--tool claude|codex|gemini] [--days N]`
+    Reports LIVE / SILENT / NOT INSTALLED per guard. A mounted guard
+    with zero runs in the window is a SILENT FAILURE -- the dangerous
+    state where the gate looks wired but nothing is checking.
+
+    (Not to be confused with `hook-verify`: the PostToolUse read-back
+    verifier that checks a claimed outbound effect is visible.)
+    """
+    try:
+        code, text = gatecheck.run(tool=args.tool, days=args.days)
+        sys.stdout.write(text)
+        return code
+    except Exception as e:
+        sys.stderr.write("verify: internal error (%s); failing open.\n" % e)
         return 0
 
 
@@ -524,6 +718,39 @@ def _entry_present(entries, key, want):
 
 
 def cmd_install(args):
+    """Install hooks for a tool (default: claude).
+
+    --tool claude  -> ~/.claude/settings.json (with backup)
+    --tool codex   -> ~/.codex/hooks.json + [features] hooks=true
+    --tool gemini  -> ~/.gemini/settings.json
+    All merges are idempotent.
+    """
+    tool = getattr(args, "tool", "claude") or "claude"
+    if tool not in xtool.TOOLS:
+        print("unknown tool %r (choose from %s)" % (tool, ", ".join(
+            xtool.TOOLS)), file=sys.stderr)
+        return 2
+    if tool == "codex":
+        hp, added, feat = xtool.install_codex()
+        print("Installed agent-guard hooks into %s (%d added)."
+              % (hp, added))
+        print("Codex hooks feature flag: %s"
+              % ("enabled" if feat else "COULD NOT ENABLE -- set "
+                 "[features] hooks=true in ~/.codex/config.toml manually"))
+        for step in xtool.mount_steps("codex"):
+            print("  " + step)
+        return 0
+    if tool == "gemini":
+        sp, added = xtool.install_gemini()
+        print("Installed agent-guard hooks into %s (%d added)."
+              % (sp, added))
+        for step in xtool.mount_steps("gemini"):
+            print("  " + step)
+        return 0
+    return _install_claude()
+
+
+def _install_claude():
     """Merge hooks into ~/.claude/settings.json (with backup)."""
     sp = _settings_path()
     settings = {}
@@ -598,6 +825,14 @@ def cmd_status(args):
     print("bash-write mode: %s" % bashwrite.mode())
     print("rules:      %s" % ", ".join(outbound.rule_ids()))
     print("settings:   %s" % _settings_path())
+    for t in ("codex", "gemini"):
+        cmds = xtool.installed_commands(t)
+        print("%-11s %d agent-guard hook entr%s" % (
+            t + ":", len(cmds), "y" if len(cmds) == 1 else "ies"))
+    print("tamper mode:  %s (threshold %.1f)"
+          % (tamper.mode(), tamper.threshold()))
+    print("hint: agent-guard verify [--tool claude|codex|gemini] checks "
+          "whether the gates are mounted AND actually ran.")
     return 0
 
 
@@ -632,12 +867,39 @@ def build_parser():
         ("semreview", "Semantic review of a test diff or shell command via "
                       "Nemotron on Nebius Token Factory (advisory, "
                       "fail-open).", cmd_semreview),
-        ("install", "Install hooks into ~/.claude/settings.json.", cmd_install),
+        ("hook-tamper", "PreToolUse hook: block weakened assertions, "
+                          "newly skipped/focused tests, and snapshot "
+                          "updates in added test text.", cmd_hook_tamper),
+        ("tamper-check", "Scan test files for tamper shapes: weakened "
+                       "assertions, .skip/.only, snapshot updates.",
+         cmd_tampercheck),
+        ("shim", "Cross-tool shim: normalize a Codex/Gemini hook payload "
+               "and run a hook command unchanged.", cmd_shim),
+        ("verify", "Gate-liveness check: are the hooks mounted, and did "
+                 "they actually run in the last N days?", cmd_gatecheck),
+        ("install", "Install hooks (--tool claude|codex|gemini, default "
+                  "claude).", cmd_install),
         ("log", "Show recent guard decisions.", cmd_log),
         ("status", "Show state paths and config.", cmd_status),
     ]:
         sp = sub.add_parser(name, help=help_text)
         sp.set_defaults(func=func)
+    sub.choices["install"].add_argument(
+        "--tool", choices=xtool.TOOLS, default="claude",
+        help="which tool's hook config to install into (default: claude)")
+    vc = sub.choices["verify"]
+    vc.add_argument("--tool", choices=xtool.TOOLS, default=None,
+                    help="check one tool (default: all three)")
+    vc.add_argument("--days", type=int, default=7,
+                    help="look-back window for hook runs (default: 7)")
+    sc2 = sub.choices["shim"]
+    sc2.add_argument("--tool", choices=("codex", "gemini"), required=True,
+                     help="which tool's payload format to normalize")
+    sc2.add_argument("--warn", action="store_true",
+                     help="downgrade blocks to warnings (events the tool "
+                          "cannot block, e.g. Gemini SessionEnd)")
+    sc2.add_argument("hook_cmd", choices=sorted(SHIM_COMMANDS),
+                     help="hook command to run after normalization")
     sub.choices["log"].add_argument("--limit", type=int, default=20)
     dc = sub.choices["decomment"]
     dc.add_argument("files", nargs="+", help="files to check or fix")
@@ -655,6 +917,11 @@ def build_parser():
     cc.add_argument("--threshold", type=float, default=None,
                     help="cheat score (0-100) that fails --check (default: "
                          "config cheat_sniff.threshold, 30)")
+    tc = sub.choices["tamper-check"]
+    tc.add_argument("paths", nargs="+", help="files or directories to scan")
+    tc.add_argument("--threshold", type=float, default=None,
+                    help="tamper score (0-100) that fails the check "
+                         "(default: config tamper.threshold, 30)")
     mc = sub.choices["mutate-check"]
     mc.add_argument("test_file", help="test file to mutate")
     mc.add_argument("test_cmd", nargs="*",
