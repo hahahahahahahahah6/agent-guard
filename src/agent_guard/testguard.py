@@ -109,37 +109,60 @@ def check(root, session_id=None):
         return True, ""  # fail open
 
 
-def _check_inner(root, session_id):
-    cfg = state.load_config()
-    ignore = cfg["test_guard"].get("ignore_paths", []) or []
+def _diff(root, session_id):
+    """(changed_tests, changed_sources, snapshot_ok). Never raises."""
     try:
-        with open(state.snapshot_path(session_id), "r", encoding="utf-8") as fh:
-            snap = json.load(fh)
+        cfg = state.load_config()
+        ignore = cfg["test_guard"].get("ignore_paths", []) or []
+        try:
+            with open(state.snapshot_path(session_id), "r",
+                      encoding="utf-8") as fh:
+                snap = json.load(fh)
+        except Exception:
+            return [], [], False
+        if not isinstance(snap, dict) or \
+                snap.get("root") != os.path.abspath(root):
+            return [], [], False
+
+        old_tests = snap.get("tests", {}) or {}
+        old_sources = snap.get("sources", {}) or {}
+
+        current = {}
+        for rel, full in _walk(root, ignore):
+            d = state.digest_of(full)
+            if d is not None:
+                current[rel] = d
+
+        changed_tests = sorted(
+            rel for rel, d in old_tests.items()
+            if rel not in current or current[rel] != d)
+        changed_sources = sorted(
+            rel for rel, d in old_sources.items()
+            if rel not in current or current[rel] != d)
+        # New source files also count as "source changed" (new feature +
+        # tests).
+        for rel in current:
+            if rel not in old_tests and rel not in old_sources \
+                    and is_source_file(rel):
+                changed_sources.append(rel)
+        return changed_tests, changed_sources, True
     except Exception:
+        return [], [], False
+
+
+def changed_test_files(root, session_id=None):
+    """Test files changed since the snapshot. Never raises."""
+    try:
+        changed, _, ok = _diff(root, session_id)
+        return changed if ok else []
+    except Exception:
+        return []
+
+
+def _check_inner(root, session_id):
+    changed_tests, changed_sources, ok = _diff(root, session_id)
+    if not ok:
         return True, ""  # no usable snapshot: fail open
-    if not isinstance(snap, dict) or snap.get("root") != os.path.abspath(root):
-        return True, ""  # snapshot is for a different project
-
-    old_tests = snap.get("tests", {}) or {}
-    old_sources = snap.get("sources", {}) or {}
-
-    current = {}
-    for rel, full in _walk(root, ignore):
-        d = state.digest_of(full)
-        if d is not None:
-            current[rel] = d
-
-    changed_tests = sorted(
-        rel for rel, d in old_tests.items()
-        if rel not in current or current[rel] != d)  # modified or deleted
-    changed_sources = sorted(
-        rel for rel, d in old_sources.items()
-        if rel not in current or current[rel] != d)
-    # New source files also count as "source changed" (new feature + tests).
-    for rel in current:
-        if rel not in old_tests and rel not in old_sources \
-                and is_source_file(rel):
-            changed_sources.append(rel)
 
     if not changed_tests:
         return True, ""
