@@ -8,8 +8,8 @@ import os
 import shutil
 import sys
 
-from . import bashwrite, cheatsniff, commentslop, gatecheck, mutate, \
-    outbound, semreview, state, tamper, testguard, verify, xtool
+from . import bashwrite, cheatsniff, commentslop, escapehatch, gatecheck, \
+    mutate, outbound, semreview, state, tamper, testguard, verify, xtool
 
 
 def _hook_input():
@@ -77,27 +77,104 @@ def cmd_test(args):
         session = str(data.get("session_id", "") or "unknown")
         root = _project_root(data)
         sid = None if session == "unknown" else session
-        allowed, reason = testguard.check(root, session_id=sid)
-        if not allowed:
-            extra = _tamper_enrichment(root, sid)
-            if extra:
-                reason = reason.rstrip("\n") + "\n" + extra
-            forced_warn = os.environ.get("AGENT_GUARD_FORCE_WARN", "") == "1"
-            warn_mode = testguard.mode() == "warn" or forced_warn
+        detail = testguard.check_detail(root, session_id=sid)
+        forced_warn = os.environ.get("AGENT_GUARD_FORCE_WARN", "") == "1"
+        warn_mode = testguard.mode() == "warn" or forced_warn
+        if detail["allowed"]:
+            if detail.get("verdicts"):
+                state.append_audit({
+                    "guard": "test", "tool": "Stop", "session": session,
+                    "decision": "allowed-legit-test-change",
+                    "files": detail["changed_tests"][:10],
+                    "verdicts": {k: v["verdict"]
+                                 for k, v in
+                                 detail["verdicts"].items()},
+                    "reason": "all changed test files classified legit",
+                })
+                if warn_mode:
+                    sys.stderr.write(
+                        "WARNING (not blocking): test files changed "
+                        "without source changes, but every change was "
+                        "classified legit:\n" +
+                        "".join("  - %s [%s]\n"
+                                % (p, detail["verdicts"][p]["verdict"])
+                                for p in detail["changed_tests"]))
+            return 0
+        reason = detail["reason"]
+        # Escape hatch: explicit, audited, always visible in `agent-guard log`.
+        hatch, hatch_reason = escapehatch.hatch_request(args)
+        if hatch:
             state.append_audit({
                 "guard": "test", "tool": "Stop", "session": session,
-                "decision": "warn" if warn_mode else "blocked",
-                "rule": "tests-only-change",
-                "reason": reason.split("\n")[0],
+                "decision": "allowed-escape-hatch",
+                "hatch_reason": hatch_reason,
+                "files": detail["changed_tests"][:10],
+                "verdicts": {k: v["verdict"]
+                             for k, v in detail["verdicts"].items()},
+                "reason": "escape hatch: %s"
+                          % (hatch_reason or "(no reason given)"),
             })
-            if warn_mode:
-                sys.stderr.write("WARNING (not blocking): " + reason + "\n")
-                return 0
-            sys.stderr.write(reason + "\n")
-            return 2
-        return 0
+            sys.stderr.write(
+                "agent-guard: test-guard escape hatch used%s -- "
+                "recorded in the audit log (`agent-guard log`).\n"
+                % (" (reason: %s)" % hatch_reason if hatch_reason else ""))
+            return 0
+        extra = _tamper_enrichment(root, sid)
+        if extra:
+            reason = reason.rstrip("\n") + "\n" + extra
+        warn_mode = testguard.mode() == "warn" or forced_warn
+        state.append_audit({
+            "guard": "test", "tool": "Stop", "session": session,
+            "decision": "warn" if warn_mode else "blocked",
+            "rule": "tests-only-change",
+            "verdicts": {k: v["verdict"]
+                         for k, v in detail["verdicts"].items()},
+            "reason": reason.split("\n")[0],
+        })
+        if warn_mode:
+            sys.stderr.write("WARNING (not blocking): " + reason + "\n")
+            return 0
+        sys.stderr.write(reason + "\n")
+        return 2
     except Exception:
         return 0  # fail open, always
+
+
+def cmd_testreview(args):
+    """Advisory: classify the test-only changes vs the current snapshot.
+
+    Prints each changed test file's verdict (legit / ambiguous /
+    malicious) and the markers behind it. Never blocks (exit 0).
+    """
+    try:
+        root = os.path.abspath(args.root) if args.root else os.getcwd()
+        sid = args.session or None
+        detail = testguard.check_detail(root, session_id=sid)
+        if not detail["snapshot_ok"]:
+            print("no usable snapshot for %s; the SessionStart hook "
+                  "(`agent-guard hook-snapshot`) records one." % root)
+            return 0
+        if not detail["changed_tests"]:
+            print("no test files changed since the snapshot.")
+            return 0
+        print("source files changed: %s"
+              % ("yes" if detail["changed_sources"] else "no"))
+        for rel in detail["changed_tests"]:
+            v = detail["verdicts"][rel]
+            print("%s: %s" % (rel, v["verdict"]))
+            for kind, excerpt in v["markers"][:10]:
+                print("  [%s] %s" % (kind, excerpt[:100]))
+        if detail["allowed"]:
+            print("verdict: STOP allowed (all changes classified legit)")
+        else:
+            print("verdict: would BLOCK -- use "
+                  "`agent-guard hook-test --allow-test-change \"<reason>\"` "
+                  "to escape (audited)")
+        return 0
+    except Exception as e:
+        sys.stderr.write("test-review: internal error (%s); failing open.\n"
+                         % e)
+        return 0
 
 
 def cmd_outbound(args):
@@ -831,6 +908,10 @@ def cmd_status(args):
             t + ":", len(cmds), "y" if len(cmds) == 1 else "ies"))
     print("tamper mode:  %s (threshold %.1f)"
           % (tamper.mode(), tamper.threshold()))
+    print("escape hatch: %s"
+          % ("ON (env AGENT_GUARD_ALLOW_TEST_CHANGE set)"
+             if os.environ.get("AGENT_GUARD_ALLOW_TEST_CHANGE", "")
+             not in ("", "0") else "off"))
     print("hint: agent-guard verify [--tool claude|codex|gemini] checks "
           "whether the gates are mounted AND actually ran.")
     return 0
@@ -847,7 +928,8 @@ def build_parser():
 
     for name, help_text, func in [
         ("hook-snapshot", "SessionStart hook: snapshot test digests.", cmd_snapshot),
-        ("hook-test", "Stop hook: block tests-only changes.", cmd_test),
+        ("hook-test", "Stop hook: block tests-only changes (with legit-test-change escape hatch).", cmd_test),
+        ("test-review", "Classify test-only changes vs the snapshot (legit/ambiguous/malicious); never blocks.", cmd_testreview),
         ("hook-outbound", "PreToolUse hook: block risky Bash actions.", cmd_outbound),
         ("hook-verify", "PostToolUse hook: warn when a claimed effect "
                         "isn't visible (never blocks).", cmd_verify),
@@ -901,6 +983,17 @@ def build_parser():
     sc2.add_argument("hook_cmd", choices=sorted(SHIM_COMMANDS),
                      help="hook command to run after normalization")
     sub.choices["log"].add_argument("--limit", type=int, default=20)
+    ht = sub.choices["hook-test"]
+    ht.add_argument("--allow-test-change", nargs="?", const="", default=None,
+                    metavar="REASON",
+                    help="escape hatch: allow test-only changes this once; "
+                         "the reason is written to the audit log "
+                         "(env AGENT_GUARD_ALLOW_TEST_CHANGE works too)")
+    tr = sub.choices["test-review"]
+    tr.add_argument("--root", default=None,
+                    help="project root (default: cwd)")
+    tr.add_argument("--session", default=None,
+                    help="session id of the snapshot to diff against")
     dc = sub.choices["decomment"]
     dc.add_argument("files", nargs="+", help="files to check or fix")
     dc.add_argument("--check", action="store_true",

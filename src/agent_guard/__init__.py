@@ -13,8 +13,11 @@ Eight guards, zero dependencies, fail-open everywhere:
   snapshot updates + tamper-check CLI)
 - gate-liveness verifier (`agent-guard verify`: are the gates mounted
   AND did they actually run?)
+- legit-test-change escape hatch (`--allow-test-change`: explicit,
+  audited one-shot bypass for legitimate test edits, plus per-file
+  legit/ambiguous/malicious classification on the Stop hook)
 plus mutate-check (mutation test-honesty CLI) and cross-tool install
 (`install --tool codex|gemini`).
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"

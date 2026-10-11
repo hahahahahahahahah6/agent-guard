@@ -12,7 +12,9 @@ standard library only):
   On `SessionStart` it snapshots hashes of every test and source file; on
   `Stop` it diffs. If test files were modified or deleted while no source
   file changed, the stop is blocked until the agent proves each changed test
-  actually fails without the fix.
+  actually fails without the fix. (v0.7: purely-benign edits — new tests,
+  fixtures, renames — pass with an audit entry; ambiguous edits can use the
+  audited `--allow-test-change` escape hatch.)
 - **Outbound-action guard** — a `PreToolUse` hook on `Bash` with a denylist
   of risky action patterns: pushes to protected branches (including force
   pushes), package publishes (`npm publish`, `twine upload`, …), prod deploys,
@@ -73,6 +75,10 @@ standard library only):
   actually run in the last N days. A configured guard with zero runs is
   reported as SILENT FAILURE — the dangerous state where the gate looks
   wired but nothing is checking.
+- **Legit-test-change escape hatch** (v0.7) — the `Stop` hook classifies
+  each changed test file (legit / ambiguous / malicious) instead of
+  blocking every tests-only change, and ships an explicit, audited bypass
+  (`--allow-test-change`) for the ambiguous-but-fine cases. See below.
 
 The failure modes are real, quoted from the community:
 
@@ -168,6 +174,50 @@ against a deterministic mock provider (`AGENT_GUARD_SEMREVIEW_MOCK`).
   adds post-exec read-back as defense-in-depth *on top of* PreToolUse
   prevention: block the bad action before it happens, then verify the claimed
   effect is actually visible afterwards. Prevent first, verify after.
+- **vs all-or-nothing guardrails** (v0.7): most test-tampering guards are
+  binary — any test edit with no source change is a violation. That makes
+  "legitimately changing tests" (snapshot updates, flaky-test fixes, new
+  fixtures) the most common false positive, and false positives get
+  guardrails ripped out. agent-guard classifies each changed test file
+  (legit / ambiguous / malicious) and ships an explicit, audited escape
+  hatch (`--allow-test-change`) for the ambiguous-but-fine cases. A
+  guardrail shouldn't be one-size-fits-all; escape is cheap, escape is
+  visible.
+
+## v0.7: legit-test-change escape hatch
+
+**The false positive that kills guardrails.** "Legitimately changing
+tests" — updating a snapshot, fixing a flaky timing test, adding a
+fixture — is the test-tampering guard's most common false positive
+(raised by reader Coldboot on dev.to: *how does the guard know a test
+change is legitimate?*). v0.7 stops being binary: the `Stop` hook now
+diffs each changed test file against its `SessionStart` copy and
+classifies the change —
+
+- **legit** — new test functions, fixtures/helpers, new imports, renames,
+  comment-only edits → the session stops normally; the pass is written to
+  the audit log (`allowed-legit-test-change`).
+- **malicious** — weakened/removed/inverted assertions, newly skipped
+  tests, try/except swallowing a removed assertion, whole-file deletion →
+  blocked as before, with the verdict named in the block message.
+- **ambiguous** — everything in between (e.g. an expected value changed at
+  the same strictness: could be a snapshot update, could be cheating) →
+  blocked as before.
+
+**The escape hatch.** For the ambiguous cases that are actually fine,
+there is an explicit bypass instead of a silent config toggle:
+
+```bash
+agent-guard hook-test --allow-test-change "updating snapshots after the API rename"
+# or, for agents that can't pass flags:
+export AGENT_GUARD_ALLOW_TEST_CHANGE=1   # reason via AGENT_GUARD_ALLOW_TEST_CHANGE_REASON
+```
+
+Every hatch use is appended to the audit log with the reason, session,
+files, and their verdicts (`decision: allowed-escape-hatch`, visible in
+`agent-guard log`). Escape is cheap; escape is visible. And
+`agent-guard test-review --session <id>` classifies the current diff
+without blocking, so you can see what the guard sees before you decide.
 
 ## v0.6: cross-tool hooks, gate-liveness check, tamper shapes
 
