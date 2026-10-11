@@ -568,3 +568,12 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# unittest-discover compatibility: run the custom suite as one test.
+import unittest as _unittest
+
+
+class TestCustomSuite(_unittest.TestCase):
+    def test_custom_suite(self):
+        self.assertEqual(main(), 0)
