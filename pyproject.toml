@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-guard-hooks"
-version = "0.5.1"
-description = "Behavior-guardrail hooks for Claude Code: test-tampering + outbound-action guards, mutation test-honesty, and post-exec verification"
+version = "0.6.0"
+description = "Behavior-guardrail hooks for Claude Code, Codex CLI and Gemini CLI: test-tampering + outbound-action guards, gate-liveness verification, and mutation test-honesty"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
