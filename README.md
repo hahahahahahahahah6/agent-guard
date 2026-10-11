@@ -2,8 +2,10 @@
 
 [![pipeline status](https://gitlab.com/hahahahahahahahah6/agent-guard/badges/main/pipeline.svg)](https://gitlab.com/hahahahahahahahah6/agent-guard/-/pipelines)
 
-Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-Six guards plus test-honesty CLIs, one install, zero dependencies (Python
+Behavior-guardrail hooks for [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
+[Codex CLI](https://developers.openai.com/codex/cli/), and
+[Gemini CLI](https://github.com/google-gemini/gemini-cli).
+Eight guards plus test-honesty CLIs, one install, zero dependencies (Python
 standard library only):
 
 - **Test-tampering guard** — stops the "green by editing the test" cheat.
@@ -53,6 +55,24 @@ standard library only):
   opinion for what regexes can't see: rephrased-but-weakened assertions,
   deleted edge cases, obfuscated exfiltration. Advisory, fail-open; see
   below.
+- **Tamper-shape guard** (v0.6) — a `PreToolUse` hook on `Write`/`Edit`
+  that scores added test text for *how* the test was changed, not just
+  *that* it changed: weakened assertions (`toBe(x)` → `toBeTruthy()`),
+  newly skipped or focused tests (`.skip(`, `.only(`, `xit(`,
+  `pytest.mark.skip`), and unreviewed snapshot updates
+  (`toMatchSnapshot()`, `.snap` files). `agent-guard tamper-check` for
+  one-shot scans; the `Stop` hook's block message now names the tamper
+  shapes it found.
+- **Cross-tool hooks** (v0.6) — the same interception rules on Codex CLI
+  and Gemini CLI. `agent-guard install --tool codex|gemini` writes each
+  tool's native hook config (`~/.codex/hooks.json`,
+  `~/.gemini/settings.json`); a `shim` normalizes each tool's hook
+  payload so every guard runs unchanged.
+- **Gate-liveness verifier** (v0.6) — `agent-guard verify
+  [--tool claude|codex|gemini]`: checks each guard is mounted *and* has
+  actually run in the last N days. A configured guard with zero runs is
+  reported as SILENT FAILURE — the dangerous state where the gate looks
+  wired but nothing is checking.
 
 The failure modes are real, quoted from the community:
 
@@ -135,11 +155,80 @@ against a deterministic mock provider (`AGENT_GUARD_SEMREVIEW_MOCK`).
   edits (write-after-write on a file another session changed). agent-guard
   blocks *misbehaving* actions (weakened tests, unapproved outbound effects).
   Different failure modes, same fail-open hook philosophy.
+- **vs Zoria-Lind behavior-enhancer-generic**: behavior-enhancer-generic
+  is a general-purpose, Chinese-language interception layer — broad
+  behavioral rules for agents. agent-guard narrows to one failure family
+  (test tampering) and goes deep on it — snapshot diffing, cheat
+  sniffing, tamper shapes, mutation honesty — then carries those rules
+  across tools (Claude Code / Codex CLI / Gemini CLI) with a verifier
+  that proves the gates are actually running. Breadth of interception vs
+  depth on test honesty: different bets.
 - **vs Kvitansiya** (Show HN, 2026-10-01): Kvitansiya verifies at stop —
   it checks the claimed outcome once, when the session ends. agent-guard v0.2
   adds post-exec read-back as defense-in-depth *on top of* PreToolUse
   prevention: block the bad action before it happens, then verify the claimed
   effect is actually visible afterwards. Prevent first, verify after.
+
+## v0.6: cross-tool hooks, gate-liveness check, tamper shapes
+
+**Cross-tool hooks.** The interception rules — especially the
+test-tampering rules — now map onto Codex CLI and Gemini CLI hook
+systems, not just Claude Code:
+
+```bash
+agent-guard install --tool codex    # ~/.codex/hooks.json + [features] hooks=true
+agent-guard install --tool gemini   # ~/.gemini/settings.json
+```
+
+Each tool's payload is normalized by `agent-guard shim` (Gemini's
+`write_file`/`replace`/`run_shell_command` → `Write`/`Edit`/`Bash`;
+Codex's `apply_patch` → added-lines extraction), so every guard runs
+unchanged. Two honest caveats: Codex only runs hooks you have trusted
+(`/hooks` pins a hash per hook — install writes the config, trust is a
+human step), and Gemini CLI has no blocking `Stop` event, so the
+test-tampering check runs at `SessionEnd` as an advisory warning there.
+
+**"Did the gate actually run?" verifier.** The failure mode that
+motivated this release, quoted from the community:
+
+> *"A gate that has quietly stopped discriminating is worse than no
+> gate"* — yuhaolin2005, dev.to, *"My Agent Migration Finished. Every
+> Gate Looked Wired. None of Them Ran."*
+
+`agent-guard verify [--tool claude|codex|gemini] [--days N]` answers it
+directly: for every guard it reports `mounted` (is the hook config
+present?) alongside `runs` and `decisions` in the window (did the hook
+actually execute?). A configured guard with zero runs is a **SILENT
+FAILURE** — exit 1, named loudly. Every hook invocation now records a
+lightweight per-day run counter (`~/.config/agent-guard/hook-pings.json`)
+plus the existing audit-log decisions; tool transcripts carry no
+hook-execution traces, so these two are the instruments.
+
+**Test-tampering, deepened.** The Stop guard already blocked "test
+files changed, no source changed". v0.6 also scores *how* the tests
+were changed — the three shapes that survive the diff check:
+
+- **weakened assertions**: `toBe(x)` → `toBeTruthy()`,
+  `assertEqual(a, b)` → `assertTrue(a)`. Green while proving less.
+- **skipped / focused tests**: `.skip(`, `.only(`, `xit(`,
+  `pytest.mark.skip`, `#[ignore]`. A skipped failing test is a green
+  suite that proves nothing.
+- **unreviewed snapshot updates**: `toMatchSnapshot()` touches and
+  `.snap` files. `jest -u` makes red go green by redefining "correct".
+
+Caught two ways: the `hook-tamper` PreToolUse hook scores added test
+text at edit time (`agent-guard tamper-check` for one-shot scans), and
+the Stop hook's block message now names the shapes it found in the
+changed files.
+
+**How it differs — vs Zoria-Lind behavior-enhancer-generic.**
+behavior-enhancer-generic is a general-purpose, Chinese-language
+interception layer: broad behavioral rules for agents. agent-guard
+narrows to one failure family — test tampering — and goes deep on it
+(snapshot diffing, cheat-sniffing, tamper shapes, mutation honesty),
+then carries those rules across tools (Claude Code / Codex CLI /
+Gemini CLI) with a verifier that proves the gates are actually running.
+Breadth of interception vs depth on test honesty: different bets.
 
 ## v0.5.1: fewer false positives, perl -i
 
@@ -322,25 +411,34 @@ Warnings are audit-logged (`guard: verify`, `decision: warn`).
 ## Install
 
 ```bash
-# Not on PyPI yet -- install from source:
-git clone https://github.com/hahahahahahahahah6/agent-guard.git
-cd agent-guard
-pip install .
-agent-guard install
+pip install agent-guard-hooks
+agent-guard install                  # Claude Code: ~/.claude/settings.json
+agent-guard install --tool codex     # Codex CLI: ~/.codex/hooks.json
+agent-guard install --tool gemini    # Gemini CLI: ~/.gemini/settings.json
 ```
 
-`install` merges five hook entries into `~/.claude/settings.json` (backing it
-up first, never clobbering existing settings):
+(From source: `git clone
+https://github.com/hahahahahahahahah6/agent-guard.git && cd agent-guard
+&& pip install .`)
 
-- `SessionStart` → `agent-guard hook-snapshot` (records digests, never blocks)
-- `Stop` → `agent-guard hook-test` (blocks tests-only changes)
-- `PreToolUse` on `Bash` → `agent-guard hook-outbound` (blocks denylisted actions)
-- `PreToolUse` on `Write|Edit` → `agent-guard hook-commentslop` (blocks
-  comment slop in added text)
-- `PostToolUse` on `Bash` → `agent-guard hook-verify` (warns when a claimed
-  effect isn't visible; never blocks)
+`install` merges hook entries into the tool's config (backing up first
+for Claude Code, never clobbering existing settings), idempotently:
 
-Restart Claude Code afterwards. No MCP server, no daemon, no accounts.
+| Tool | Config | Session start | Before tool use | After tool use | Session end |
+|---|---|---|---|---|---|
+| Claude Code | `~/.claude/settings.json` | `hook-snapshot` | `hook-outbound`, `hook-bashwrite` on `Bash`; `hook-commentslop`, `hook-cheatsniff`, `hook-tamper` on `Write\|Edit` | `hook-verify` on `Bash` | `hook-test` (blocks) |
+| Codex CLI | `~/.codex/hooks.json` (+ `[features] hooks=true` in `config.toml`) | `hook-snapshot` | `hook-outbound`, `hook-bashwrite` on `Bash`; shimmed `hook-commentslop`, `hook-cheatsniff`, `hook-tamper` on `apply_patch` | `hook-verify` on `Bash` | `hook-test` (blocks) |
+| Gemini CLI | `~/.gemini/settings.json` | `hook-snapshot` | `hook-outbound`, `hook-bashwrite` on `run_shell_command`; shimmed `hook-commentslop`, `hook-cheatsniff`, `hook-tamper` on `write_file\|replace` | `hook-verify` on `run_shell_command` | `hook-test` via shim `--warn` (advisory — Gemini has no blocking Stop event) |
+
+Restart the tool afterwards. No MCP server, no daemon, no accounts.
+
+Then check the gates are actually running:
+
+```bash
+agent-guard verify                    # all three tools, last 7 days
+agent-guard verify --tool codex       # one tool
+agent-guard verify --days 1           # since yesterday
+```
 
 ## What the agent sees
 
@@ -403,6 +501,10 @@ allowed rather than breaking your workflow.
     "mode": "block",
     "protected_paths": ["src/", "infra/"],
     "allow": []
+  },
+  "tamper": {
+    "mode": "block",
+    "threshold": 30
   }
 }
 ```
@@ -427,6 +529,10 @@ allowed rather than breaking your workflow.
   test-tampering guard's scope: test files plus `conftest.py`).
 - `bash_write.allow`: `"path-or-basename:bash-write"` entries that suppress
   the Bash-write guard, e.g. `"tests/fixtures/:bash-write"`.
+- `tamper.mode`: `"block"` (default) or `"warn"`. Env override:
+  `AGENT_GUARD_TAMPER_MODE=warn`.
+- `tamper.threshold`: tamper score (0–100) at which the tamper hook
+  trips. Env override: `AGENT_GUARD_TAMPER_THRESHOLD`.
 - `outbound.allow`: regexes that win over the denylist (e.g. your internal
   registry). Every override is audit-logged.
 - `outbound.deny_extra` / `disabled_rules`: extend or trim the denylist.
@@ -515,6 +621,12 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
   no content to score — block mode blocks the bypass shape itself. If that
   is too strict for your workflow, use warn mode or write through the Edit
   tool instead.
+- **Cross-tool hooks inherit each tool's limits.** Codex only executes
+  hooks you have trusted (`/hooks` pins a hash per hook) and ignores
+  `hooks.json` unless `[features] hooks=true`; Gemini CLI has no blocking
+  `Stop` event, so the test-tampering check there is an advisory
+  `SessionEnd` warning, not a block. `agent-guard verify` reports the
+  wiring it can see — it cannot confirm you completed Codex's trust step.
 
 ## Roadmap
 
