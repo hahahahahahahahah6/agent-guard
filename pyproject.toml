@@ -20,3 +20,7 @@ Homepage = "https://github.com/hahahahahahahahah6/agent-guard"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# demo/fixtures contain intentionally broken sample tests; only collect the real suite
+testpaths = ["tests"]

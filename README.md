@@ -698,10 +698,10 @@ agent-guard mutate-check tests/test_billing.py -- pytest -q
 ## Development
 
 ```bash
-python -m pytest tests/   # 107 tests, all passing
+python -m pytest   # 178 tests, all passing
 ```
 
-107 pytest tests, all passing. The shipped package has zero dependencies;
+178 pytest tests, all passing. The shipped package has zero dependencies;
 `pytest` is the only test-runner dependency.
 
 ## GitLab CI
