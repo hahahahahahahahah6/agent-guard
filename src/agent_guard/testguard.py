@@ -20,7 +20,7 @@ import time
 import json
 import zlib
 
-from . import escapehatch, state
+from . import escapehatch, semreview, state
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
              ".tox", "dist", "build", ".idea", ".vscode", "target"}
@@ -224,6 +224,71 @@ def _load_snapshot(root, session_id):
         return None
 
 
+def _attach_semantic_opinions(verdicts, pairs):
+    """Attach Nemotron second opinions to suspicious file verdicts.
+
+    Only files the deterministic classifier did NOT call "legit" are sent.
+    Runs only when semreview auto mode is enabled AND a review is actually
+    possible (NEBIUS_API_KEY or AGENT_GUARD_SEMREVIEW_MOCK). Never raises;
+    any failure leaves verdicts untouched (fail-open, advisory only).
+    """
+    try:
+        if not verdicts or not pairs:
+            return
+        if not semreview.auto_enabled():
+            return
+        if not semreview.available():
+            return
+        changes = {}
+        for rel, v in verdicts.items():
+            try:
+                if not isinstance(v, dict) or v.get("verdict") == "legit":
+                    continue
+                old, new = pairs.get(rel, (None, None))
+                changes[rel] = (old, new, v)
+            except Exception:
+                continue
+        if not changes:
+            return
+        for rel, result in semreview.review_suspicious(changes).items():
+            if rel in verdicts and isinstance(verdicts[rel], dict):
+                verdicts[rel]["semantic"] = result
+    except Exception:
+        pass
+
+
+def _semantic_section(verdicts):
+    """Advisory Nemotron-opinion block for the Stop-hook message.
+
+    Returns "" when no file carries a semantic verdict. Never raises.
+    """
+    try:
+        lines = []
+        for rel in sorted(verdicts):
+            v = verdicts.get(rel)
+            sem = v.get("semantic") if isinstance(v, dict) else None
+            if not isinstance(sem, dict):
+                continue
+            sv = semreview.effective_verdict(sem)
+            try:
+                conf = float(sem.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                conf = 0.0
+            rationale = sem.get("rationale", "")
+            rationale = rationale if isinstance(rationale, str) \
+                else str(rationale)
+            lines.append("  - %s: %s (confidence %.2f): %s"
+                         % (rel, sv.upper(), conf, rationale[:200]))
+        if not lines:
+            return ""
+        return (
+            "\nSemantic second opinion (NVIDIA Nemotron on Nebius Token "
+            "Factory, advisory only -- it did not change this decision):\n"
+            + "\n".join(lines) + "\n")
+    except Exception:
+        return ""
+
+
 def check_detail(root, session_id=None):
     """Full Stop-hook decision with per-file classification. Never raises.
 
@@ -255,6 +320,7 @@ def _check_detail_inner(root, session_id):
     snap = _load_snapshot(root, session_id) or {}
     contents = snap.get("test_contents", {}) or {}
     verdicts = {}
+    pairs = {}
     for rel in changed_tests:
         old = _decode_content(contents.get(rel))
         new = _read_current(root, rel)
@@ -266,7 +332,15 @@ def _check_detail_inner(root, session_id):
                                           "no snapshot copy to diff")] }
         else:
             verdicts[rel] = escapehatch.classify_change(old, new, rel)
+        pairs[rel] = (old, new)
     base["verdicts"] = verdicts
+
+    # Optional Nemotron second opinion on the suspicious (non-legit) files.
+    # Advisory only: it enriches the message below, never changes the
+    # allow/block decision. Skipped unless explicitly enabled AND a review
+    # is actually possible (API key or mock) -- the default path stays
+    # exactly as quiet and as fast as before.
+    _attach_semantic_opinions(verdicts, pairs)
 
     if verdicts and all(v["verdict"] == "legit"
                         for v in verdicts.values()):
@@ -285,7 +359,8 @@ def _check_detail_inner(root, session_id):
         "Test-tampering guard: test files changed but no source files "
         "changed since this session started.\n"
         "Changed test files (with change classification):\n" +
-        "\n".join(lines) + "\n"
+        "\n".join(lines) + "\n" +
+        _semantic_section(verdicts) +
         "This matches a known failure mode where an agent edits test "
         "assertions to make them pass instead of fixing the source code. "
         "Before proceeding, verify each changed test actually fails without "

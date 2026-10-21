@@ -173,6 +173,10 @@ def default_config():
             "mode": "warn",        # "warn" downgrades a model "block" to
                                    # "warn"; "block" honors it. Env override:
                                    # AGENT_GUARD_SEMREVIEW_MODE
+            "auto": False,         # automatic Nemotron second opinion on the
+                                   # Stop hook for suspicious test changes
+                                   # (advisory only, fail-open). Env override:
+                                   # AGENT_GUARD_SEMREVIEW_AUTO=1
             "model": "nvidia/nemotron-3-nano-30b-a3b",  # Nemotron on Nebius
                                    # Token Factory. Env override:
                                    # AGENT_GUARD_SEMREVIEW_MODEL

@@ -562,3 +562,118 @@ def format_human(result, verdict=None, label=""):
         return "\n".join(lines)
     except Exception:
         return "Semantic review: unavailable (fail-open)."
+
+
+# ---------------------------------------------------------------------------
+# automatic second opinion (opt-in Stop-hook integration)
+# ---------------------------------------------------------------------------
+
+def auto_enabled(cfg=None):
+    """True when the automatic second opinion is enabled. Never raises.
+
+    Env AGENT_GUARD_SEMREVIEW_AUTO wins ("1"/"true"/"yes"/"on" -> on,
+    "0"/"false"/"no"/"off" -> off); otherwise the semreview.auto config
+    key (default False). Default is off: a Stop hook should not add
+    network latency unless the user asked for it.
+    """
+    try:
+        env = (os.environ.get("AGENT_GUARD_SEMREVIEW_AUTO") or ""
+               ).strip().lower()
+        if env in ("1", "true", "yes", "on"):
+            return True
+        if env in ("0", "false", "no", "off"):
+            return False
+        cfg = cfg if isinstance(cfg, dict) else state.load_config()
+        return bool(_section(cfg).get("auto", False))
+    except Exception:
+        return False
+
+
+def available(cfg=None):
+    """True when a live review can actually run: mock env or API key.
+
+    When False the hook integration skips silently, so the default path
+    (no key configured) stays exactly as quiet as before. Never raises.
+    """
+    try:
+        if os.environ.get("AGENT_GUARD_SEMREVIEW_MOCK"):
+            return True
+        return bool(api_key())
+    except Exception:
+        return False
+
+
+def build_change_context(rel, classification, max_markers=5):
+    """Short deterministic-guard context header for the model. Never raises.
+
+    classification is the per-file dict from escapehatch.classify_change
+    (verdict + markers); it tells Nemotron *why* the pattern guard got
+    suspicious, so the semantic judgment starts from the right suspicion.
+    """
+    try:
+        verdict = ""
+        markers = []
+        if isinstance(classification, dict):
+            verdict = str(classification.get("verdict", ""))
+            markers = classification.get("markers", []) or []
+        lines = ["[pattern-guard classification: %s]"
+                 % (verdict or "unknown")]
+        for kind, excerpt in list(markers)[:max_markers]:
+            try:
+                ex = str(excerpt)[:200].replace("\n", " ")
+            except Exception:
+                ex = "?"
+            lines.append("[marker %s] %s" % (kind, ex))
+        return "\n".join(lines)
+    except Exception:
+        return "[pattern-guard classification: unknown]"
+
+
+def _unified_diff(rel, old, new):
+    """Unified diff of two file texts. Never raises."""
+    try:
+        import difflib
+        o = (old or "").splitlines()
+        n = (new or "").splitlines()
+        if o == n:
+            return ""
+        return "\n".join(difflib.unified_diff(
+            o, n, fromfile="a/" + str(rel), tofile="b/" + str(rel)))
+    except Exception:
+        return ""
+
+
+def review_suspicious(changes, cfg=None, provider=None):
+    """Semantic second opinion on suspicious test-file changes. Never raises.
+
+    changes: {rel: (old_text, new_text, classification_dict)}.
+    Returns {rel: verdict-dict} for files where the model produced a
+    non-degraded verdict. Degraded results (no key, network error,
+    unparseable output) are skipped silently -- the deterministic guard's
+    decision stands on its own and the advisory layer simply has nothing
+    to add. Fails open: never raises, never blocks.
+    """
+    out = {}
+    try:
+        items = list((changes or {}).items())
+    except Exception:
+        return out
+    cfg = cfg if isinstance(cfg, dict) else state.load_config()
+    for rel, triple in items:
+        try:
+            old, new, classification = triple
+        except Exception:
+            continue
+        try:
+            diff_text = _unified_diff(rel, old, new)
+            if not diff_text.strip():
+                continue
+            context = build_change_context(rel, classification)
+            result = review("diff", context + "\n" + diff_text,
+                            path_hint=str(rel), cfg=cfg, provider=provider,
+                            use_cache=True)
+            if isinstance(result, dict) and not result.get("degraded"):
+                out[rel] = result
+        except Exception:
+            continue
+    return out

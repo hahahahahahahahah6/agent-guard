@@ -150,6 +150,40 @@ by content hash in the state dir (7-day TTL), and the default model is
 No new dependencies: the API call is stdlib `urllib`, and every test runs
 against a deterministic mock provider (`AGENT_GUARD_SEMREVIEW_MOCK`).
 
+### Automatic second opinion (opt-in)
+
+The reviewer can also run itself: when the Stop hook's test-tampering
+guard flags a session (test files changed, sources untouched) and the
+deterministic classifier does *not* call a change clearly legit, the
+suspicious files' unified diffs are sent to Nemotron automatically, with
+the pattern guard's own classification (verdict + markers) prepended as
+context. The model's verdict is attached to the block message as an
+advisory note — **it never changes the allow/block decision**. A model
+"pass" cannot un-block a session; a model "block" is reported as a
+warning unless `semreview.mode` is `"block"`.
+
+It is off by default (a Stop hook should not add network latency
+uninvited). Enable it per project:
+
+```jsonc
+// $AGENT_GUARD_DIR/config.json
+{ "semreview": { "auto": true } }
+```
+
+or per run:
+
+```bash
+export AGENT_GUARD_SEMREVIEW_AUTO=1
+export NEBIUS_API_KEY="..."
+```
+
+When no key (and no mock) is configured the hook skips silently, so the
+default path stays exactly as fast and as quiet as before. Degraded
+results (timeout, malformed JSON) are dropped rather than shown — the
+deterministic guard's decision stands on its own. Files classified
+"legit" are never sent, and per-content caching keeps repeat sessions
+free.
+
 ## Differentiation
 
 - **vs Rashomon** (r/aiagents): Rashomon *observes* — it records commands,
