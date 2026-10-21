@@ -1,0 +1,16 @@
+# Pinned dependency snapshot for agent-guard-hooks.
+#
+# The runtime is stdlib-only (see pyproject.toml: no [project].dependencies),
+# so this lockfile pins the build backend and the dev/test toolchain instead,
+# keeping reproducible builds and CI.
+#
+# Regenerate: pip freeze > requirements.lock  (after `pip install -e .[dev]`
+# once dev extras exist), then review the diff before committing.
+
+setuptools==68.1.2
+pytest==9.1.1
+iniconfig==2.3.0
+packaging==25.0
+pluggy==1.6.0
+pygments==2.19.2
+tomli==2.3.0
