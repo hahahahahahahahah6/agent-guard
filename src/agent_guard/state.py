@@ -177,6 +177,13 @@ def default_config():
                                    # Stop hook for suspicious test changes
                                    # (advisory only, fail-open). Env override:
                                    # AGENT_GUARD_SEMREVIEW_AUTO=1
+            "auto_projects": [],   # per-project gate: absolute project-root
+                                   # paths where auto may run. A project not
+                                   # listed here additionally needs a
+                                   # .agent-guard-semreview marker file in
+                                   # its root -- a bare auto:true never
+                                   # applies globally (AGENT_GUARD_DIR is
+                                   # shared across all projects).
             "model": "nvidia/nemotron-3-nano-30b-a3b",  # Nemotron on Nebius
                                    # Token Factory. Env override:
                                    # AGENT_GUARD_SEMREVIEW_MODEL

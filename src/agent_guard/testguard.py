@@ -224,21 +224,31 @@ def _load_snapshot(root, session_id):
         return None
 
 
-def _attach_semantic_opinions(verdicts, pairs):
-    """Attach Nemotron second opinions to suspicious file verdicts.
+def attach_semantic_opinions(detail, root=None, budget_s=8.0):
+    """Run the Nemotron second opinion AFTER the allow/block decision.
 
-    Only files the deterministic classifier did NOT call "legit" are sent.
-    Runs only when semreview auto mode is enabled AND a review is actually
-    possible (NEBIUS_API_KEY or AGENT_GUARD_SEMREVIEW_MOCK). Never raises;
-    any failure leaves verdicts untouched (fail-open, advisory only).
+    Returns an independent {rel: opinion-dict}. Opinions are NEVER written
+    into verdicts: verdicts feed the decision, so keeping the two
+    structures separate is what guarantees no future change can leak a
+    model opinion into the allow/block outcome (P-M1).
+
+    Must be called only after the deterministic decision is final (block
+    or warn) and the user has not taken the escape hatch -- see
+    cli.cmd_test. Appends the advisory section to detail["reason"].
+    Never raises.
     """
+    opinions = {}
     try:
+        if not isinstance(detail, dict):
+            return opinions
+        verdicts = detail.get("verdicts") or {}
+        pairs = detail.get("pairs") or {}
         if not verdicts or not pairs:
-            return
-        if not semreview.auto_enabled():
-            return
+            return opinions
+        if not semreview.auto_enabled(root=root):
+            return opinions
         if not semreview.available():
-            return
+            return opinions
         changes = {}
         for rel, v in verdicts.items():
             try:
@@ -249,41 +259,49 @@ def _attach_semantic_opinions(verdicts, pairs):
             except Exception:
                 continue
         if not changes:
-            return
-        for rel, result in semreview.review_suspicious(changes).items():
-            if rel in verdicts and isinstance(verdicts[rel], dict):
-                verdicts[rel]["semantic"] = result
+            return opinions
+        opinions = semreview.review_suspicious(changes, budget_s=budget_s)
+        section = _semantic_section(opinions)
+        if section:
+            detail["reason"] = (detail.get("reason") or "").rstrip("\n") \
+                + "\n" + section
+        return opinions
     except Exception:
-        pass
+        return opinions
 
 
-def _semantic_section(verdicts):
+def _semantic_section(opinions):
     """Advisory Nemotron-opinion block for the Stop-hook message.
 
-    Returns "" when no file carries a semantic verdict. Never raises.
+    Only non-"pass" opinions are shown: a PASS is written to the audit
+    log by the caller and never handed to the agent, so a compromised
+    model cannot talk the agent into the escape hatch (P-H2). Rationales
+    are sanitized (P-H2). Returns "". Never raises.
     """
     try:
+        mock = bool(os.environ.get("AGENT_GUARD_SEMREVIEW_MOCK"))
+        label = ("NVIDIA Nemotron on Nebius Token Factory (mock)"
+                 if mock else "NVIDIA Nemotron on Nebius Token Factory")
         lines = []
-        for rel in sorted(verdicts):
-            v = verdicts.get(rel)
-            sem = v.get("semantic") if isinstance(v, dict) else None
-            if not isinstance(sem, dict):
+        for rel in sorted(opinions):
+            op = opinions.get(rel)
+            if not isinstance(op, dict):
                 continue
-            sv = semreview.effective_verdict(sem)
+            sv = semreview.effective_verdict(op)
+            if sv == "pass":
+                continue  # pass opinions: audit log only, never shown
             try:
-                conf = float(sem.get("confidence", 0.0))
+                conf = float(op.get("confidence", 0.0))
             except (TypeError, ValueError):
                 conf = 0.0
-            rationale = sem.get("rationale", "")
-            rationale = rationale if isinstance(rationale, str) \
-                else str(rationale)
+            rationale = semreview.sanitize_rationale(op.get("rationale", ""))
             lines.append("  - %s: %s (confidence %.2f): %s"
-                         % (rel, sv.upper(), conf, rationale[:200]))
+                         % (rel, sv.upper(), conf, rationale))
         if not lines:
             return ""
         return (
-            "\nSemantic second opinion (NVIDIA Nemotron on Nebius Token "
-            "Factory, advisory only -- it did not change this decision):\n"
+            "\nSemantic second opinion (%s, advisory only -- it did not "
+            "change this decision):\n" % label
             + "\n".join(lines) + "\n")
     except Exception:
         return ""
@@ -334,13 +352,10 @@ def _check_detail_inner(root, session_id):
             verdicts[rel] = escapehatch.classify_change(old, new, rel)
         pairs[rel] = (old, new)
     base["verdicts"] = verdicts
-
-    # Optional Nemotron second opinion on the suspicious (non-legit) files.
-    # Advisory only: it enriches the message below, never changes the
-    # allow/block decision. Skipped unless explicitly enabled AND a review
-    # is actually possible (API key or mock) -- the default path stays
-    # exactly as quiet and as fast as before.
-    _attach_semantic_opinions(verdicts, pairs)
+    # File contents for a possible later semantic review. The review itself
+    # runs in cli.cmd_test AFTER the allow/block decision is final and the
+    # escape hatch was not taken -- never here (P-C1/P-H1).
+    base["pairs"] = pairs
 
     if verdicts and all(v["verdict"] == "legit"
                         for v in verdicts.values()):
@@ -360,7 +375,6 @@ def _check_detail_inner(root, session_id):
         "changed since this session started.\n"
         "Changed test files (with change classification):\n" +
         "\n".join(lines) + "\n" +
-        _semantic_section(verdicts) +
         "This matches a known failure mode where an agent edits test "
         "assertions to make them pass instead of fixing the source code. "
         "Before proceeding, verify each changed test actually fails without "
