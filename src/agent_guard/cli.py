@@ -100,7 +100,6 @@ def cmd_test(args):
                                 % (p, detail["verdicts"][p]["verdict"])
                                 for p in detail["changed_tests"]))
             return 0
-        reason = detail["reason"]
         # Escape hatch: explicit, audited, always visible in `agent-guard log`.
         hatch, hatch_reason = escapehatch.hatch_request(args)
         if hatch:
@@ -119,18 +118,29 @@ def cmd_test(args):
                 "recorded in the audit log (`agent-guard log`).\n"
                 % (" (reason: %s)" % hatch_reason if hatch_reason else ""))
             return 0
+        # Nemotron second opinion -- only now that the block/warn decision
+        # is final and the user has not taken the escape hatch (P-C1/P-H1).
+        # Advisory: enriches the message, never changes the decision; a
+        # model PASS is audit-only, never shown to the agent (P-H2).
+        opinions = testguard.attach_semantic_opinions(detail, root=root)
+        reason = detail["reason"]
         extra = _tamper_enrichment(root, sid)
         if extra:
             reason = reason.rstrip("\n") + "\n" + extra
         warn_mode = testguard.mode() == "warn" or forced_warn
-        state.append_audit({
+        audit_rec = {
             "guard": "test", "tool": "Stop", "session": session,
             "decision": "warn" if warn_mode else "blocked",
             "rule": "tests-only-change",
             "verdicts": {k: v["verdict"]
                          for k, v in detail["verdicts"].items()},
             "reason": reason.split("\n")[0],
-        })
+        }
+        if opinions:
+            audit_rec["semantic"] = {
+                rel: semreview.effective_verdict(op)
+                for rel, op in opinions.items()}
+        state.append_audit(audit_rec)
         if warn_mode:
             sys.stderr.write("WARNING (not blocking): " + reason + "\n")
             return 0
@@ -758,7 +768,8 @@ SNIPPETS = {
     "SessionStart": [{"hooks": [{"type": "command",
                                  "command": "agent-guard hook-snapshot"}]}],
     "Stop": [{"hooks": [{"type": "command",
-                         "command": "agent-guard hook-test"}]}],
+                         "command": "agent-guard hook-test",
+                         "timeout": 30}]}],
     "PreToolUse": [{"matcher": "Bash",
                     "hooks": [{"type": "command",
                                "command": "agent-guard hook-outbound"}]},
