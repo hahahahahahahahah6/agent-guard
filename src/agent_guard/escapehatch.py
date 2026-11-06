@@ -43,7 +43,20 @@ ENV_REASON = "AGENT_GUARD_ALLOW_TEST_CHANGE_REASON"
 # line-level patterns
 # ---------------------------------------------------------------------------
 
+# Bare Python `assert x` / `assert(x)`.
 _ASSERT_RX = re.compile(r"^\s*assert(?:\s+|\s*\()")
+# Assertions that are *calls*, not statements. `_strictness` already scores
+# these shapes (toBe, toBeTruthy, assertEqual, assertTrue); without them here
+# the single-token cheat -- `toBe(10)` -> `toBe(9)` -- never reaches
+# `_compare_asserts` and falls through to the >0.9-similarity "renamed"
+# branch, i.e. it is classified legit and the Stop hook lets it pass.
+_ASSERT_CALL_RX = re.compile(
+    r"(?:^|[^\w.])expect\s*\(|"              # jest / vitest / chai
+    r"\bassert(?:ions)?\s*\.\s*\w+\s*\(|"    # assert.strictEqual, testify
+    r"\b(?:self|cls|this)\s*\.\s*assert\w*\s*\(|"   # unittest
+    r"^\s*assert\w+\s*\(|"                   # assertEqual(...) imported bare
+    r"\bshould\s*\.\s*\w+|\.\s*should\b|"    # chai should
+    r"\brequire\s*\.\s*\w+\s*\(")            # chai require-style
 _NEW_TEST_RX = re.compile(r"^\s*(?:async\s+)?def\s+test\w*\s*\(")
 _FIXTURE_RX = re.compile(r"^\s*@pytest\.fixture\b")
 _HELPER_DEF_RX = re.compile(r"^\s*(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(")
@@ -58,13 +71,21 @@ _SKIP_RX = re.compile(
 
 def _is_assert(line):
     try:
-        return bool(_ASSERT_RX.match(line or ""))
+        s = line or ""
+        return bool(_ASSERT_RX.match(s) or _ASSERT_CALL_RX.search(s))
     except Exception:
         return False
 
 
 def _assert_body(line):
-    """Text after `assert ` / `assert(...)`. Never raises."""
+    """The part of an assertion that carries its proof strength.
+
+    For bare Python asserts that is the text after `assert `. For call-shaped
+    assertions (`expect(x).toBe(10)`, `self.assertEqual(a, b)`) the matcher
+    *is* the strength, so the whole expression is the body -- `_strictness`
+    reads `toBe(` / `toBeTruthy` / `assertEqual` out of it directly.
+    Never raises.
+    """
     try:
         s = (line or "").strip()
         m = re.match(r"^assert\s*\((.*)\)\s*$", s)
@@ -73,6 +94,8 @@ def _assert_body(line):
         m = re.match(r"^assert\s+(.*)$", s)
         if m:
             return m.group(1).strip()
+        if _ASSERT_CALL_RX.search(s):
+            return s.rstrip(";").strip()
         return ""
     except Exception:
         return ""
