@@ -138,6 +138,50 @@ class EscapeHatchTest(unittest.TestCase):
             BASE_TEST, "# checks addition\n" + BASE_TEST, "tests/test_app.py")
         self.assertEqual(v["verdict"], "legit", v)
 
+    # --- non-Python assertion styles (regression) ---
+    # `_strictness` always scored jest/unittest matchers, but `_is_assert`
+    # only matched bare Python `assert`, so call-shaped assertions never
+    # reached `_compare_asserts`: a one-token edit scored >0.9 similar and
+    # came back "renamed" -> legit. The README's flagship cheat --
+    # `toBe(10)` -> `toBe(9)` -- was therefore allowed by the Stop hook.
+    JS_TEST = ('test("pagination", () => {\n'
+               '  expect(page.items.length).toBe(10);\n});\n')
+
+    def test_classifier_jest_value_change_is_not_legit(self):
+        v = escapehatch.classify_change(
+            self.JS_TEST, self.JS_TEST.replace("toBe(10)", "toBe(9)"),
+            "tests/cart.test.js")
+        self.assertEqual(v["verdict"], "ambiguous", v)
+
+    def test_classifier_jest_weakened_assert_is_malicious(self):
+        v = escapehatch.classify_change(
+            self.JS_TEST,
+            self.JS_TEST.replace("toBe(10)", "toBeTruthy()"),
+            "tests/cart.test.js")
+        self.assertEqual(v["verdict"], "malicious", v)
+
+    def test_classifier_unittest_value_change_is_not_legit(self):
+        old = "    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n"
+        v = escapehatch.classify_change(
+            old, old.replace(", 3)", ", 4)"), "tests/test_app.py")
+        self.assertEqual(v["verdict"], "ambiguous", v)
+
+    def test_classifier_unittest_weakened_assert_is_malicious(self):
+        old = "    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n"
+        v = escapehatch.classify_change(
+            old, "    def test_add(self):\n        self.assertTrue(add(1, 2))\n",
+            "tests/test_app.py")
+        self.assertEqual(v["verdict"], "malicious", v)
+
+    def test_classifier_non_assertion_rename_still_legit(self):
+        # `expectedCount` starts with "expect" but is not an assertion:
+        # broadening the matcher must not swallow ordinary renames.
+        old = "const expectedCount = 10;\n"
+        self.assertFalse(escapehatch._is_assert(old))
+        v = escapehatch.classify_change(
+            old, "const expectedCounts = 10;\n", "tests/cart.test.js")
+        self.assertEqual(v["verdict"], "legit", v)
+
     # --- Stop-hook integration tests ---
     def test_legit_change_allowed_and_audited(self):
         with open(self.test_path, "a") as fh:
