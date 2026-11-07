@@ -20,7 +20,7 @@ import time
 import json
 import zlib
 
-from . import escapehatch, state
+from . import escapehatch, semreview, state
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
              ".tox", "dist", "build", ".idea", ".vscode", "target"}
@@ -224,6 +224,89 @@ def _load_snapshot(root, session_id):
         return None
 
 
+def attach_semantic_opinions(detail, root=None, budget_s=8.0):
+    """Run the Nemotron second opinion AFTER the allow/block decision.
+
+    Returns an independent {rel: opinion-dict}. Opinions are NEVER written
+    into verdicts: verdicts feed the decision, so keeping the two
+    structures separate is what guarantees no future change can leak a
+    model opinion into the allow/block outcome (P-M1).
+
+    Must be called only after the deterministic decision is final (block
+    or warn) and the user has not taken the escape hatch -- see
+    cli.cmd_test. Appends the advisory section to detail["reason"].
+    Never raises.
+    """
+    opinions = {}
+    try:
+        if not isinstance(detail, dict):
+            return opinions
+        verdicts = detail.get("verdicts") or {}
+        pairs = detail.get("pairs") or {}
+        if not verdicts or not pairs:
+            return opinions
+        if not semreview.auto_enabled(root=root):
+            return opinions
+        if not semreview.available():
+            return opinions
+        changes = {}
+        for rel, v in verdicts.items():
+            try:
+                if not isinstance(v, dict) or v.get("verdict") == "legit":
+                    continue
+                old, new = pairs.get(rel, (None, None))
+                changes[rel] = (old, new, v)
+            except Exception:
+                continue
+        if not changes:
+            return opinions
+        opinions = semreview.review_suspicious(changes, budget_s=budget_s)
+        section = _semantic_section(opinions)
+        if section:
+            detail["reason"] = (detail.get("reason") or "").rstrip("\n") \
+                + "\n" + section
+        return opinions
+    except Exception:
+        return opinions
+
+
+def _semantic_section(opinions):
+    """Advisory Nemotron-opinion block for the Stop-hook message.
+
+    Only non-"pass" opinions are shown: a PASS is written to the audit
+    log by the caller and never handed to the agent, so a compromised
+    model cannot talk the agent into the escape hatch (P-H2). Rationales
+    are sanitized (P-H2). Returns "". Never raises.
+    """
+    try:
+        mock = bool(os.environ.get("AGENT_GUARD_SEMREVIEW_MOCK"))
+        label = ("NVIDIA Nemotron on Nebius Token Factory (mock)"
+                 if mock else "NVIDIA Nemotron on Nebius Token Factory")
+        lines = []
+        for rel in sorted(opinions):
+            op = opinions.get(rel)
+            if not isinstance(op, dict):
+                continue
+            sv = semreview.effective_verdict(op)
+            if sv == "pass":
+                continue  # pass opinions: audit log only, never shown
+            try:
+                conf = float(op.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                conf = 0.0
+            rationale = semreview.sanitize_rationale(op.get("rationale", ""))
+            lines.append("  - %s: %s (confidence %.2f): %s"
+                         % (rel, sv.upper(), conf, rationale))
+        if not lines:
+            return ""
+        return (
+            "\nSemantic second opinion (%s, advisory only -- it did not "
+            "change this decision):\n" % label
+            + "\n".join(lines) + "\n")
+    except Exception:
+        return ""
+
+
 def check_detail(root, session_id=None):
     """Full Stop-hook decision with per-file classification. Never raises.
 
@@ -255,6 +338,7 @@ def _check_detail_inner(root, session_id):
     snap = _load_snapshot(root, session_id) or {}
     contents = snap.get("test_contents", {}) or {}
     verdicts = {}
+    pairs = {}
     for rel in changed_tests:
         old = _decode_content(contents.get(rel))
         new = _read_current(root, rel)
@@ -266,7 +350,12 @@ def _check_detail_inner(root, session_id):
                                           "no snapshot copy to diff")] }
         else:
             verdicts[rel] = escapehatch.classify_change(old, new, rel)
+        pairs[rel] = (old, new)
     base["verdicts"] = verdicts
+    # File contents for a possible later semantic review. The review itself
+    # runs in cli.cmd_test AFTER the allow/block decision is final and the
+    # escape hatch was not taken -- never here (P-C1/P-H1).
+    base["pairs"] = pairs
 
     if verdicts and all(v["verdict"] == "legit"
                         for v in verdicts.values()):
@@ -285,7 +374,7 @@ def _check_detail_inner(root, session_id):
         "Test-tampering guard: test files changed but no source files "
         "changed since this session started.\n"
         "Changed test files (with change classification):\n" +
-        "\n".join(lines) + "\n"
+        "\n".join(lines) + "\n" +
         "This matches a known failure mode where an agent edits test "
         "assertions to make them pass instead of fixing the source code. "
         "Before proceeding, verify each changed test actually fails without "
